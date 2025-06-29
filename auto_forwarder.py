@@ -886,6 +886,10 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         if hasattr(entity, 'username') and entity.username: return f"@{entity.username}"
         return self._get_entity_name(entity)
 
+    def _get_chat_name(self, chat_id):
+        """A convenience function to get a chat name directly from its ID."""
+        return self._get_entity_name(self._get_chat_entity(int(chat_id)))
+
     def _get_original_author_details(self, fwd_header):
         """Helper to extract original author details from a fwd_header."""
         if not fwd_header:
