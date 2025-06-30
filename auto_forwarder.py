@@ -78,7 +78,7 @@ __id__ = "auto_forwarder"
 __name__ = "Auto Forwarder"
 __description__ = "Sets up forwarding rules for any chat, including users, groups, and channels."
 __author__ = "@T3SL4"
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __min_version__ = "11.9.1"
 __icon__ = "Putin_1337/14"
 
@@ -277,8 +277,21 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         rule = self.forwarding_rules.get(source_chat_id)
         if not rule or not rule.get("enabled", False):
             return
-
-        # Step 2: Anti-Spam Firewall. Check per-user rate limit to prevent flooding.
+    
+        # --- CORRECTED LOGIC ORDER ---
+        # Step 2: Album Handling. This must come BEFORE the anti-spam check.
+        # We group all album parts first, so they don't trigger the rate limit against each other.
+        grouped_id = getattr(message, 'grouped_id', 0)
+        if grouped_id != 0:
+            if grouped_id not in self.album_buffer:
+                log(f"[{self.id}] Detected start of new album: {grouped_id}")
+                album_task = AlbumTask(self, grouped_id)
+                self.album_buffer[grouped_id] = {'messages': [], 'task': album_task}
+                self.handler.postDelayed(album_task, self.album_timeout_ms)
+            self.album_buffer[grouped_id]['messages'].append(message_object)
+            return # IMPORTANT: We are done with this message part, it is now buffered.
+    
+        # Step 3: Anti-Spam Firewall. Now only applies to non-album messages.
         if self.antispam_delay_seconds > 0:
             author_id = get_user_config().getClientUserId() if message.out else self._get_id_from_peer(message.from_id)
             if author_id:
@@ -292,44 +305,31 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
                 self.user_last_message_time[author_id] = current_time
                 if len(self.user_last_message_time) > self.USER_TIMESTAMP_CACHE_SIZE:
                     self.user_last_message_time.popitem(last=False)
-
-        # Step 3: Check per-rule setting for forwarding own messages.
+    
+        # Step 4: Check per-rule setting for forwarding own messages.
         should_forward_own = rule.get("forward_own", True)
         if message.out and not should_forward_own:
             return
-
-        # Step 4: Generate a stable, unique key for this message event for deduplication.
+    
+        # Step 5: Generate a stable, unique key for this message event for deduplication.
         event_key = None
         if message.out:
             event_key = ("outgoing", message.dialog_id, message.date, message.message or "")
         else:
             author_id = self._get_id_from_peer(message.from_id)
             event_key = ("incoming", author_id, source_chat_id, message.id)
-
-        # Step 5: Deduplication. Ignore if this exact event has been processed recently.
+    
+        # Step 6: Deduplication.
         if any(key == event_key for key, ts in self.processed_keys):
             return
-        
-        # Step 6: Album Handling. Buffer messages with the same grouped_id to send as one album.
-        grouped_id = getattr(message, 'grouped_id', 0)
-        if grouped_id != 0:
-            if grouped_id not in self.album_buffer:
-                log(f"[{self.id}] Detected start of new album: {grouped_id}")
-                album_task = AlbumTask(self, grouped_id)
-                self.album_buffer[grouped_id] = {'messages': [], 'task': album_task}
-                self.handler.postDelayed(album_task, self.album_timeout_ms)
-            self.album_buffer[grouped_id]['messages'].append(message_object)
-            return
-
-        # Step 7: Deferral. Delay processing if needed data is not yet available.
+            
+        # Step 7: Deferral logic for single messages.
         is_media = hasattr(message, 'media') and message.media and not isinstance(message.media, TLRPC.TL_messageMediaEmpty)
         is_incomplete_media = is_media and not self._is_media_complete(message)
-
-        # Also defer if it's a reply but the replied-to message object is missing from the notification.
-        # This gives the client time to load it into the cache.
+    
         is_reply = hasattr(message, 'reply_to') and message.reply_to is not None
         is_reply_object_missing = is_reply and not (hasattr(message_object, 'replyMessageObject') and message_object.replyMessageObject)
-
+    
         if is_incomplete_media or is_reply_object_missing:
             if event_key not in self.deferred_messages:
                 reason = "incomplete media" if is_incomplete_media else "missing reply object"
@@ -338,13 +338,13 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
                 self.deferred_messages[event_key] = (message_object, deferred_task)
                 self.handler.postDelayed(deferred_task, self.deferral_timeout_ms)
             return
-
-        # Step 8: Final Processing. If a message was deferred, clear its pending task.
+    
+        # Step 8: Final Processing.
         if event_key in self.deferred_messages:
             _, deferred_task = self.deferred_messages[event_key]
             self.handler.removeCallbacks(deferred_task)
             del self.deferred_messages[event_key]
-            
+                
         self.process_and_send(message_object, event_key)
 
     def _process_timed_out_message(self, event_key):
@@ -503,27 +503,35 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         entities.add(quote_entity)
 
         return quote_text, entities
-        
+
     def _send_album(self, message_objects, rule):
         """Constructs and sends an album, filtering each item and attaching a header/quote to the first."""
         if not message_objects: return
-
+    
         to_peer_id = rule["destination"]
         drop_author = rule.get("drop_author", True)
         quote_replies = rule.get("quote_replies", True)
         filters = rule.get("filters", {})
-        text_allowed = filters.get("text", True)
-
+    
         try:
             req = TLRPC.TL_messages_sendMultiMedia()
             req.peer = get_messages_controller().getInputPeer(to_peer_id)
             multi_media_list = ArrayList()
-
+    
+            album_caption = ""
+            album_entities = None
+            text_allowed = filters.get("text", True)
+            if text_allowed:
+                for msg_obj in message_objects:
+                    if msg_obj.messageOwner and msg_obj.messageOwner.message:
+                        album_caption = msg_obj.messageOwner.message
+                        album_entities = msg_obj.messageOwner.entities
+                        break
+    
             first_message_obj = message_objects[0]
             first_message = first_message_obj.messageOwner
-
-            # Build the prefix (header and/or quote) that will be attached to the first image's caption.
-            prefix_text, prefix_entities, header_attached = "", ArrayList(), False
+            prefix_text, prefix_entities = "", ArrayList()
+            
             if not drop_author:
                 source_entity = self._get_chat_entity(self._get_id_from_peer(first_message.peer_id))
                 author_entity = self._get_chat_entity(self._get_id_from_peer(first_message.from_id))
@@ -538,50 +546,54 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
                 if quote_text:
                     if prefix_text: prefix_text += "\n\n"
                     if quote_entities:
-                        # Adjust offsets of quote entities to fit after the header text.
                         for i in range(quote_entities.size()):
                             entity = quote_entities.get(i)
                             entity.offset += len(prefix_text)
                         prefix_entities.addAll(quote_entities)
                     prefix_text += quote_text
-            
-            # Iterate through all messages in the album.
-            for msg_obj in message_objects:
-                if not self._is_message_allowed_by_filters(msg_obj, rule):
+    
+            header_attached = False
+            for original_msg_obj in message_objects:
+                current_msg_obj = original_msg_obj
+                if not self._is_media_complete(original_msg_obj.messageOwner):
+                    try:
+                        original_message = original_msg_obj.messageOwner
+                        if hasattr(get_messages_controller(), 'getMessage'):
+                            cached_message_obj = get_messages_controller().getMessage(original_message.dialog_id, original_message.id)
+                            if cached_message_obj and self._is_media_complete(cached_message_obj.messageOwner):
+                                current_msg_obj = cached_message_obj
+                                log(f"[{self.id}] Refreshed incomplete album part {original_message.id} from cache.")
+                    except Exception as e:
+                        log(f"[{self.id}] Could not refresh album part from cache. Error: {e}")
+    
+                if not self._is_message_allowed_by_filters(current_msg_obj, rule):
                     continue
-
-                input_media = self._get_input_media(msg_obj)
-                if not input_media: continue
-
+    
+                input_media = self._get_input_media(current_msg_obj)
+                if not input_media:
+                    continue
+    
                 single_media = TLRPC.TL_inputSingleMedia()
                 single_media.media = input_media
                 single_media.random_id = random.getrandbits(63)
                 
-                original_caption = (msg_obj.messageOwner.message or "") if text_allowed else ""
-                original_entities = msg_obj.messageOwner.entities if text_allowed else None
-                
-                # The prefix is only attached to the first item of the album.
                 if not header_attached:
-                    final_caption = f"{prefix_text}\n\n{original_caption}".strip()
-                    final_entities = self._prepare_final_entities(prefix_text, prefix_entities, original_entities)
+                    final_caption = f"{prefix_text}\n\n{album_caption}".strip()
+                    final_entities = self._prepare_final_entities(prefix_text, prefix_entities, album_entities)
                     single_media.message = final_caption
                     if final_entities and not final_entities.isEmpty():
                         single_media.entities = final_entities
                         single_media.flags |= 1
                     header_attached = True
                 else:
-                    # Subsequent items only get their original caption.
-                    single_media.message = original_caption
-                    if original_entities and not original_entities.isEmpty():
-                        single_media.entities = original_entities
-                        single_media.flags |= 1
+                    single_media.message = ""
                 
                 multi_media_list.add(single_media)
             
             if not multi_media_list.isEmpty():
                 req.multi_media = multi_media_list
                 send_request(req, RequestCallback(lambda r, e: None))
-
+    
         except Exception:
             log(f"[{self.id}] ERROR in _send_album: {traceback.format_exc()}")
 
