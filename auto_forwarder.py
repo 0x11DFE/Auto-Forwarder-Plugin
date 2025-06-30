@@ -78,7 +78,7 @@ __id__ = "auto_forwarder"
 __name__ = "Auto Forwarder"
 __description__ = "Sets up forwarding rules for any chat, including users, groups, and channels."
 __author__ = "@T3SL4"
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 __min_version__ = "11.9.1"
 __icon__ = "Putin_1337/14"
 
@@ -452,7 +452,7 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         self._send_forwarded_message(message_object, rule)
 
     def _build_reply_quote(self, message_object):
-        """Builds a visual quote block for a replied-to message."""
+        """Builds a native-style visual quote block for a replied-to message."""
         replied_message_obj = message_object.replyMessageObject
         if not replied_message_obj or not replied_message_obj.messageOwner:
             return None, None
@@ -460,16 +460,19 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         replied_message = replied_message_obj.messageOwner
         author_id = self._get_id_from_peer(replied_message.from_id)
         author_entity = self._get_chat_entity(author_id)
-        author_name = self._get_entity_tag(author_entity)
-
-        # Check if the replied-to message was itself a forward.
+        
+        # Use the full name for the quote header, not the @username tag
+        author_name = self._get_entity_name(author_entity)
+    
+        # Check if the replied-to message was itself a forward, and get the original source
         original_fwd_tag, _ = self._get_original_author_details(replied_message.fwd_from)
-
+    
+        # Generate a snippet of the replied-to message content
         quote_snippet = ""
         if replied_message_obj.messageText:
             quote_snippet = str(replied_message_obj.messageText)
-            if len(quote_snippet) > 40:
-                quote_snippet = quote_snippet[:40] + "..."
+            if len(quote_snippet) > 45:
+                quote_snippet = quote_snippet[:45].strip() + "..."
         elif replied_message_obj.isPhoto():
             quote_snippet = "Photo"
         elif replied_message_obj.isVideo():
@@ -481,27 +484,35 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         else:
             quote_snippet = "Media"
         
-        # Build the initial reply line.
-        reply_line = f"Replying to {author_name}"
-        
-        # Append the original forward source if it exists.
+        # If the reply was to a forwarded message, add context to the snippet
         if original_fwd_tag:
-            reply_line += f" (fwd from {original_fwd_tag})"
+            quote_snippet += f" (from {original_fwd_tag})"
             
-        quote_text = f"{reply_line}\n> {quote_snippet}"
-        
-        # Build rich text entities for the quote block.
+        # Build the final text and entities for a native look
+        quote_text = f"{author_name}\n{quote_snippet}"
         entities = ArrayList()
-        italic_entity = TLRPC.TL_messageEntityItalic()
-        italic_entity.offset = 0
-        italic_entity.length = len(reply_line) # Use the length of the potentially extended line.
-        entities.add(italic_entity)
-
+        
+        # 1. Make the author's name bold and, if possible, a clickable mention
+        author_entity_to_add = None
+        if isinstance(author_entity, TLRPC.TL_user) and not author_entity.username:
+            # This creates the blue, clickable, bold name for users without a public @
+            mention = TLRPC.TL_messageEntityMentionName()
+            mention.user_id = author_entity.id
+            author_entity_to_add = mention
+        else:
+            # Fallback for channels, groups, or users with usernames
+            author_entity_to_add = TLRPC.TL_messageEntityBold()
+    
+        author_entity_to_add.offset = 0
+        author_entity_to_add.length = len(author_name)
+        entities.add(author_entity_to_add)
+    
+        # 2. Make the entire block a quote, which adds the vertical bar on the left
         quote_entity = TLRPC.TL_messageEntityBlockquote()
-        quote_entity.offset = quote_text.find('>')
-        quote_entity.length = len(quote_snippet) + 2
+        quote_entity.offset = 0
+        quote_entity.length = len(quote_text)
         entities.add(quote_entity)
-
+    
         return quote_text, entities
 
     def _send_album(self, message_objects, rule):
