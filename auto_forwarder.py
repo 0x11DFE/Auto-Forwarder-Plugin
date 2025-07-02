@@ -77,7 +77,7 @@ __id__ = "auto_forwarder"
 __name__ = "Auto Forwarder"
 __description__ = "Sets up forwarding rules for any chat, including users, groups, and channels."
 __author__ = "@T3SL4"
-__version__ = "1.3.0"
+__version__ = "1.4.1"
 __min_version__ = "11.9.1"
 __icon__ = "Putin_1337/14"
 
@@ -118,8 +118,8 @@ Go to a chat where a rule is active and open the "Auto Forward..." menu item aga
 When setting up a rule, you have a checkbox for "Remove Original Author".
 - **Checked (Copy Mode):** Sends a brand new message to the destination. It looks like you sent it yourself. All text formatting is preserved.
 - **Unchecked (Forward Mode):** Performs a standard Telegram forward, including the "Forwarded from..." header, preserving the original author's context.
-* **Can I stop my own messages from being forwarded?**
-Yes. When creating or modifying a rule, uncheck the "Forward My Own Messages" option. This is useful if you only want to forward messages you *receive* in a chat, not those you send.
+* **Can I control which messages get forwarded?**
+Yes. When creating or modifying a rule, you can choose to forward messages from regular users, bots, and your own outgoing messages independently.
 --- **✨ Advanced Features & Formatting** ---
 * **How does the Anti-Spam Firewall work?**
 It's a rate-limiter that prevents a single user from flooding your destination chat. It works by enforcing a minimum time delay between forwards *from the same person*. You can configure this delay in the General Settings.
@@ -243,12 +243,31 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         except Exception:
             log(f"[{self.id}] ERROR in notification handler: {traceback.format_exc()}")
 
+    def _get_author_type(self, message):
+        """Determines if the message is from a user, a bot, or is outgoing."""
+        if message.out:
+            return "outgoing"
+        
+        author_entity = self._get_chat_entity(self._get_id_from_peer(message.from_id))
+        if author_entity and getattr(author_entity, 'bot', False):
+            return "bot"
+        
+        return "user"
+
     def handle_message_event(self, message_object):
         """Main processing pipeline for each incoming message."""
         message = message_object.messageOwner
         source_chat_id = self._get_id_from_peer(message.peer_id)
         rule = self.forwarding_rules.get(source_chat_id)
         if not rule or not rule.get("enabled", False):
+            return
+
+        author_type = self._get_author_type(message)
+        if author_type == "outgoing" and not rule.get("forward_outgoing", True):
+            return
+        if author_type == "user" and not rule.get("forward_users", True):
+            return
+        if author_type == "bot" and not rule.get("forward_bots", True):
             return
 
         grouped_id = getattr(message, 'grouped_id', 0)
@@ -272,10 +291,6 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
                 self.user_last_message_time[author_id] = current_time
                 if len(self.user_last_message_time) > self.USER_TIMESTAMP_CACHE_SIZE:
                     self.user_last_message_time.popitem(last=False)
-
-        should_forward_own = rule.get("forward_own", True)
-        if message.out and not should_forward_own:
-            return
 
         event_key = None
         if message.out:
@@ -1017,6 +1032,7 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             
             main_layout = LinearLayout(activity)
             main_layout.setOrientation(LinearLayout.VERTICAL)
+            main_layout.setPadding(margin_px, margin_px // 2, margin_px, margin_px // 4)
             
             input_field = EditText(activity)
             input_field_params = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
@@ -1029,15 +1045,16 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             
             checkbox_tint_list = ColorStateList([[-16842912], [16842912]], [Theme.getColor(Theme.key_checkbox), Theme.getColor(Theme.key_checkboxCheck)])
             
-            drop_author_checkbox = CheckBox(activity)
             checkbox_params = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-            checkbox_params.setMargins(margin_px, margin_px // 2, margin_px, 0)
+            checkbox_params.setMargins(margin_px, 0, margin_px, 0)
+    
+            drop_author_checkbox = CheckBox(activity)
             drop_author_checkbox.setText("Remove Original Author (Copy)")
             drop_author_checkbox.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
             drop_author_checkbox.setButtonTintList(checkbox_tint_list)
             drop_author_checkbox.setLayoutParams(checkbox_params)
             main_layout.addView(drop_author_checkbox)
-
+    
             quote_replies_checkbox = CheckBox(activity)
             quote_replies_checkbox.setText("Quote Replies")
             quote_replies_checkbox.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
@@ -1045,42 +1062,77 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             quote_replies_checkbox.setLayoutParams(checkbox_params)
             main_layout.addView(quote_replies_checkbox)
             
-            forward_own_checkbox = CheckBox(activity)
-            forward_own_checkbox.setText("Forward My Own Messages")
-            forward_own_checkbox.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
-            forward_own_checkbox.setButtonTintList(checkbox_tint_list)
-            forward_own_checkbox.setLayoutParams(checkbox_params)
-            main_layout.addView(forward_own_checkbox)
-            
-            divider_view = View(activity)
-            divider_view.setBackgroundColor(Theme.getColor(Theme.key_divider))
             divider_height_px = int(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 1, activity.getResources().getDisplayMetrics()))
             divider_params = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, divider_height_px)
-            divider_params.setMargins(margin_px, margin_px, margin_px, margin_px // 2)
-            divider_view.setLayoutParams(divider_params)
-            main_layout.addView(divider_view)
+            extra_left_margin_dp = 16 
+            extra_left_margin_px = int(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, extra_left_margin_dp, activity.getResources().getDisplayMetrics()))
             
-            header_params = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-            header_params.setMargins(margin_px, 0, margin_px, 0)
+            # Define a balanced vertical margin for the dividers.
+            vertical_margin_dp = 12
+            vertical_margin_px = int(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, vertical_margin_dp, activity.getResources().getDisplayMetrics()))
+            divider_params.setMargins(margin_px + extra_left_margin_px, vertical_margin_px, margin_px, vertical_margin_px)
+    
+            divider_one = View(activity)
+            divider_one.setBackgroundColor(Theme.getColor(Theme.key_divider))
+            divider_one.setLayoutParams(divider_params)
+            main_layout.addView(divider_one)
+    
+            # --- Author Type Checkboxes ---
+            author_header_params = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            author_header_params.setMargins(margin_px, 0, margin_px, 0)
+            author_header = TextView(activity)
+            author_header.setText("Forward messages from:")
+            author_header.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            author_header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16)
+            author_header.setLayoutParams(author_header_params)
+            main_layout.addView(author_header)
+    
+            forward_users_checkbox = CheckBox(activity)
+            forward_users_checkbox.setText("Users")
+            forward_users_checkbox.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            forward_users_checkbox.setButtonTintList(checkbox_tint_list)
+            forward_users_checkbox.setLayoutParams(checkbox_params)
+            main_layout.addView(forward_users_checkbox)
+            
+            forward_bots_checkbox = CheckBox(activity)
+            forward_bots_checkbox.setText("Bots")
+            forward_bots_checkbox.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            forward_bots_checkbox.setButtonTintList(checkbox_tint_list)
+            forward_bots_checkbox.setLayoutParams(checkbox_params)
+            main_layout.addView(forward_bots_checkbox)
+    
+            forward_outgoing_checkbox = CheckBox(activity)
+            forward_outgoing_checkbox.setText("Outgoing Messages")
+            forward_outgoing_checkbox.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            forward_outgoing_checkbox.setButtonTintList(checkbox_tint_list)
+            forward_outgoing_checkbox.setLayoutParams(checkbox_params)
+            main_layout.addView(forward_outgoing_checkbox)
+            
+            divider_two = View(activity)
+            divider_two.setBackgroundColor(Theme.getColor(Theme.key_divider))
+            divider_two.setLayoutParams(divider_params)
+            main_layout.addView(divider_two)
+            
+            # --- Content Filter Section ---
+            filter_header_params = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            filter_header_params.setMargins(margin_px, 0, margin_px, 0)
             filter_header = TextView(activity)
             filter_header.setText("Content to forward:")
             filter_header.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
             filter_header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16)
-            filter_header.setLayoutParams(header_params)
+            filter_header.setLayoutParams(filter_header_params)
             main_layout.addView(filter_header)
             
             filter_checkboxes = {}
-            cb_params = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-            cb_params.setMargins(margin_px, 0, margin_px, 0)
             for key, label in FILTER_TYPES.items():
                 cb = CheckBox(activity)
                 cb.setText(label)
                 cb.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
                 cb.setButtonTintList(checkbox_tint_list)
-                cb.setLayoutParams(cb_params)
+                cb.setLayoutParams(checkbox_params)
                 main_layout.addView(cb)
                 filter_checkboxes[key] = cb
-
+    
             if existing_rule:
                 destination_id = existing_rule.get("destination", 0)
                 dest_entity = self._get_chat_entity(destination_id)
@@ -1091,7 +1143,10 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
                 
                 drop_author_checkbox.setChecked(existing_rule.get("drop_author", False))
                 quote_replies_checkbox.setChecked(existing_rule.get("quote_replies", True))
-                forward_own_checkbox.setChecked(existing_rule.get("forward_own", True))
+                
+                forward_users_checkbox.setChecked(existing_rule.get("forward_users", True))
+                forward_bots_checkbox.setChecked(existing_rule.get("forward_bots", True))
+                forward_outgoing_checkbox.setChecked(existing_rule.get("forward_outgoing", True))
                 
                 current_filters = existing_rule.get("filters", {})
                 for key, cb in filter_checkboxes.items():
@@ -1099,10 +1154,12 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             else:
                 drop_author_checkbox.setChecked(False)
                 quote_replies_checkbox.setChecked(True)
-                forward_own_checkbox.setChecked(True)
+                forward_users_checkbox.setChecked(True)
+                forward_bots_checkbox.setChecked(True)
+                forward_outgoing_checkbox.setChecked(True)
                 for cb in filter_checkboxes.values():
                     cb.setChecked(True)
-
+    
             scroller = ScrollView(activity)
             scroller.addView(main_layout)
             builder.set_view(scroller)
@@ -1115,7 +1172,9 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
                     input_field.getText().toString(),
                     drop_author_checkbox.isChecked(),
                     quote_replies_checkbox.isChecked(),
-                    forward_own_checkbox.isChecked(),
+                    forward_users_checkbox.isChecked(),
+                    forward_bots_checkbox.isChecked(),
+                    forward_outgoing_checkbox.isChecked(),
                     filter_settings
                 )
             
@@ -1125,26 +1184,36 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         except Exception:
             log(f"[{self.id}] ERROR showing rule setup dialog: {traceback.format_exc()}")
 
-    def _process_destination_input(self, source_id, source_name, user_input, drop_author, quote_replies, forward_own, filter_settings):
+    def _process_destination_input(self, source_id, source_name, user_input, drop_author, quote_replies, forward_users, forward_bots, forward_outgoing, filter_settings):
         """Handles all destination types with a multi-step resolution logic."""
         cleaned_input = (user_input or "").strip()
         if not cleaned_input: return
 
+        # A dictionary to pass all the rule settings neatly.
+        rule_settings = {
+            "drop_author": drop_author,
+            "quote_replies": quote_replies,
+            "forward_users": forward_users,
+            "forward_bots": forward_bots,
+            "forward_outgoing": forward_outgoing,
+            "filter_settings": filter_settings
+        }
+
         if "/joinchat/" in cleaned_input or "/+" in cleaned_input:
-            self._resolve_as_invite_link(cleaned_input, source_id, source_name, drop_author, quote_replies, forward_own, filter_settings)
+            self._resolve_as_invite_link(cleaned_input, source_id, source_name, rule_settings)
             return
         
         try:
             input_as_int = int(cleaned_input)
             cached_entity = self._get_chat_entity_from_input_id(input_as_int)
             if cached_entity:
-                self._finalize_rule(source_id, source_name, self._get_id_for_storage(cached_entity), self._get_entity_name(cached_entity), drop_author, quote_replies, forward_own, filter_settings)
+                self._finalize_rule(source_id, source_name, self._get_id_for_storage(cached_entity), self._get_entity_name(cached_entity), rule_settings)
                 return
-            self._resolve_by_id_shotgun(input_as_int, source_id, source_name, drop_author, quote_replies, forward_own, filter_settings)
+            self._resolve_by_id_shotgun(input_as_int, source_id, source_name, rule_settings)
         except ValueError:
-            self._resolve_as_username(cleaned_input, source_id, source_name, drop_author, quote_replies, forward_own, filter_settings)
+            self._resolve_as_username(cleaned_input, source_id, source_name, rule_settings)
 
-    def _resolve_as_invite_link(self, cleaned_input, source_id, source_name, drop_author, quote_replies, forward_own, filter_settings):
+    def _resolve_as_invite_link(self, cleaned_input, source_id, source_name, rule_settings):
         """Resolves a destination using a t.me/joinchat/... link."""
         try:
             hash_val = cleaned_input.split("/")[-1]
@@ -1159,13 +1228,13 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
                 if dest_entity:
                     get_messages_controller().putChat(dest_entity, False)
                     dest_id = self._get_id_for_storage(dest_entity)
-                    self._finalize_rule(source_id, source_name, dest_id, self._get_entity_name(dest_entity), drop_author, quote_replies, forward_own, filter_settings)
+                    self._finalize_rule(source_id, source_name, dest_id, self._get_entity_name(dest_entity), rule_settings)
             
             send_request(req, RequestCallback(on_check_invite))
         except Exception as e:
             log(f"[{self.id}] Failed to process invite link: {e}")
 
-    def _resolve_by_id_shotgun(self, input_as_int, source_id, source_name, drop_author, quote_replies, forward_own, filter_settings):
+    def _resolve_by_id_shotgun(self, input_as_int, source_id, source_name, rule_settings):
         """Resolves a numeric ID that is not in the local cache by making a network request."""
         log(f"[{self.id}] ID {input_as_int} not in cache. Attempting network lookup.")
         
@@ -1179,7 +1248,7 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             if dest_entity:
                 get_messages_controller().putChat(dest_entity, True)
                 dest_id = self._get_id_for_storage(dest_entity)
-                self._finalize_rule(source_id, source_name, dest_id, self._get_entity_name(dest_entity), drop_author, quote_replies, forward_own, filter_settings)
+                self._finalize_rule(source_id, source_name, dest_id, self._get_entity_name(dest_entity), rule_settings)
             else:
                 BulletinHelper.show_error(f"Could not find chat by ID: {input_as_int}")
 
@@ -1195,7 +1264,7 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         req.id = id_list
         send_request(req, RequestCallback(on_get_chats_complete))
 
-    def _resolve_as_username(self, username, source_id, source_name, drop_author, quote_replies, forward_own, filter_settings):
+    def _resolve_as_username(self, username, source_id, source_name, rule_settings):
         """Resolver for public links and @usernames."""
         log(f"[{self.id}] Resolving '{username}' as a username/public link.")
         
@@ -1215,7 +1284,7 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             
             if dest_entity:
                 dest_id = self._get_id_for_storage(dest_entity)
-                self._finalize_rule(source_id, source_name, dest_id, self._get_entity_name(dest_entity), drop_author, quote_replies, forward_own, filter_settings)
+                self._finalize_rule(source_id, source_name, dest_id, self._get_entity_name(dest_entity), rule_settings)
             else:
                 BulletinHelper.show_error(f"Could not resolve '{username}'.")
         
@@ -1226,7 +1295,7 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         except Exception:
             log(f"[{self.id}] ERROR resolving username: {traceback.format_exc()}")
 
-    def _finalize_rule(self, source_id, source_name, destination_id, dest_name, drop_author, quote_replies, forward_own, filter_settings):
+    def _finalize_rule(self, source_id, source_name, destination_id, dest_name, rule_settings):
         """Saves a fully resolved rule to storage and shows a success message."""
         if destination_id == 0:
             log(f"[{self.id}] Finalize rule called with invalid destination_id=0. Aborting.")
@@ -1236,10 +1305,12 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         rule_data = {
             "destination": destination_id,
             "enabled": True,
-            "drop_author": drop_author,
-            "quote_replies": quote_replies,
-            "forward_own": forward_own,
-            "filters": filter_settings
+            "drop_author": rule_settings["drop_author"],
+            "quote_replies": rule_settings["quote_replies"],
+            "forward_users": rule_settings["forward_users"],
+            "forward_bots": rule_settings["forward_bots"],
+            "forward_outgoing": rule_settings["forward_outgoing"],
+            "filters": rule_settings["filter_settings"]
         }
         self.forwarding_rules[source_id] = rule_data
         self._save_forwarding_rules()
