@@ -1,10 +1,10 @@
 # Auto Forwarder Plugin
 
-[![Version](https://img.shields.io/badge/version-1.5.2-blue.svg)](https://github.com/0x11DFE/Auto-Forwarder-Plugin/releases)
+[![Version](https://img.shields.io/badge/version-1.6.4-blue.svg)](https://github.com/0x11DFE/Auto-Forwarder-Plugin/releases)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Telegram](https://img.shields.io/badge/author-%40T3SL4-blue.svg)](https://t.me/T3SL4)
 
-An advanced plugin for **exteraGram** that gives you total control over message forwarding. Automatically copy or forward messages from any chat to another with powerful filters, granular controls, and perfect format preservation.
+An advanced plugin for **exteraGram** that gives you total control over message forwarding. Automatically copy or forward messages from any chat to another with powerful filters, an integrated auto-updater, and perfect format preservation.
 
 > [!WARNING]
 > ### 🔐 Disclaimer – Read Before Using
@@ -22,6 +22,7 @@ An advanced plugin for **exteraGram** that gives you total control over message 
 * [Contributing](#-contributing)
 * [Support the Developer](#%EF%B8%8F-support-the-developer)
 * [License](#-license)
+
 ---
 
 ## 📸 Preview
@@ -30,6 +31,12 @@ An advanced plugin for **exteraGram** that gives you total control over message 
 
 
 ## ✨ Features
+
+* **Seamless Auto-Updater:**
+    * Get notified directly in the app when a new version is available on GitHub Releases.
+    * View the official changelog in a pop-up dialog before updating.
+    * Update with a single click—no manual downloads or installs required.
+    * Includes both automatic background checks and a manual check button.
 
 * **Two Powerful Forwarding Modes:**
     * **Copy Mode:** Sends a brand new message, making it look like you sent it yourself. This mode enables:
@@ -50,10 +57,6 @@ An advanced plugin for **exteraGram** that gives you total control over message 
     * **Media Deferral:** Includes a safety net for large or slow-to-download media, retrying to ensure files are forwarded reliably.
     * **Anti-Spam Firewall:** A built-in rate-limiter prevents a single user from flooding your destination chat with rapid messages.
 
-* **Highly Configurable & Integrated:**
-    * Set global settings for message length, timeouts, and anti-spam delays.
-    * Configure each rule individually with its own unique filters and forwarding mode directly from the chat menu.
-
 
 ## 🛠️ Installation
 
@@ -62,6 +65,8 @@ An advanced plugin for **exteraGram** that gives you total control over message 
 3.  Open Telegram and send the `.plugin` file to yourself (e.g., in your "Saved Messages").
 4.  Tap on the file you just sent within the Telegram app.
 5.  A confirmation dialog will appear. Tap **INSTALL PLUGIN** to finish.
+
+> After the first installation, the plugin can update itself using the built-in updater.
 
 ## 📖 How to Use
 
@@ -82,8 +87,10 @@ This plugin is configured entirely through the Telegram user interface.
 
 ## ⚙️ Configuration
 
-You can see a list of all your active rules and configure global settings (timeouts, anti-spam delay, etc.) by going to:
+All global settings and a list of all active rules can be found by going to:
 `Settings > exteraGram Settings > Plugins > Auto Forwarder`
+
+At the bottom of this page, you will also find the **"Check for Updates"** button.
 
 
 ## 🤝 Contributing
