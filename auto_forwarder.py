@@ -32,6 +32,8 @@ import random
 import collections
 import time
 import re
+import os
+import threading
 
 # --- Chaquopy Import for Java Interoperability ---
 from java.chaquopy import dynamic_proxy
@@ -49,7 +51,7 @@ from android.text import InputType, Html
 from android.text.method import LinkMovementMethod
 from android.util import TypedValue
 from android.view import View, ViewGroup
-from java.util import ArrayList, HashSet
+from java.util import ArrayList, HashSet, Scanner
 from android.content.res import ColorStateList
 from android.content import ClipData, ClipboardManager, Context
 from android.os import Handler, Looper
@@ -57,12 +59,15 @@ from java.lang import Runnable, String as JavaString
 from android.content import Intent
 from android.net import Uri
 from android.graphics import Typeface
+from java.net import URL, HttpURLConnection
+from java.io import File, FileOutputStream
 
 # --- Telegram & Client Utilities ---
-from org.telegram.messenger import NotificationCenter, MessageObject
+from org.telegram.messenger import NotificationCenter, MessageObject, R, Utilities
 from org.telegram.tgnet import TLRPC
 from org.telegram.ui.ActionBar import Theme
 from com.exteragram.messenger.plugins.ui import PluginSettingsActivity
+from com.exteragram.messenger.plugins import PluginsController
 from client_utils import (
     get_messages_controller,
     get_last_fragment,
@@ -77,7 +82,7 @@ __id__ = "auto_forwarder"
 __name__ = "Auto Forwarder"
 __description__ = "Sets up forwarding rules for any chat, including users, groups, and channels."
 __author__ = "@T3SL4"
-__version__ = "1.5.2"
+__version__ = "1.6.4"
 __min_version__ = "11.9.1"
 __icon__ = "Putin_1337/14"
 
@@ -186,6 +191,23 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
     USDT_ADDRESS = "TXLJNebRRAhwBRKtELMHJPNMtTZYHeoYBo"
     USER_TIMESTAMP_CACHE_SIZE = 500
 
+    # --- Updater Configuration ---
+    GITHUB_OWNER = "0x11DFE"
+    GITHUB_REPO = "Auto-Forwarder-Plugin"
+    UPDATE_INTERVAL_SECONDS = 6 * 60 * 60  # 6 hours
+
+    class InstallCallback(dynamic_proxy(Utilities.Callback)):
+        """A robust proxy class for the plugin installation callback."""
+        def __init__(self, callback_func):
+            super().__init__()
+            self.callback_func = callback_func
+        
+        def run(self, arg):
+            try:
+                self.callback_func(arg)
+            except Exception:
+                log(f"[{__id__}] Error in install callback proxy: {traceback.format_exc()}")
+
     def __init__(self):
         super().__init__()
         self.id = __id__
@@ -196,20 +218,33 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         self.processed_keys = collections.deque(maxlen=200)
         self.handler = Handler(Looper.getMainLooper())
         self.user_last_message_time = collections.OrderedDict()
+        self.updater_thread = None
+        self.stop_updater_thread = threading.Event()
         self._load_configurable_settings()
 
     def on_plugin_load(self):
-        """Called when the plugin is loaded. Registers the new message observer."""
+        """Called when the plugin is loaded. Registers the new message observer and starts the updater."""
         log(f"[{self.id}] Loading version {__version__}...")
         self._load_configurable_settings()
         self._load_forwarding_rules()
         self._add_chat_menu_item()
+        
+        self.stop_updater_thread.clear()
+        if self.updater_thread is None or not self.updater_thread.is_alive():
+            self.updater_thread = threading.Thread(target=self._updater_loop)
+            self.updater_thread.daemon = True
+            self.updater_thread.start()
+            log(f"[{self.id}] Auto-updater thread started.")
+
         account_instance = get_account_instance()
         if account_instance:
             account_instance.getNotificationCenter().addObserver(self, NotificationCenter.didReceiveNewMessages)
 
     def on_plugin_unload(self):
         """Called when the plugin is unloaded. Removes the observer and cancels any pending tasks."""
+        self.stop_updater_thread.set()
+        log(f"[{self.id}] Auto-updater thread stopped.")
+
         account_instance = get_account_instance()
         if account_instance:
             account_instance.getNotificationCenter().removeObserver(self, NotificationCenter.didReceiveNewMessages)
@@ -393,12 +428,10 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         if not text_to_check:
             return False
         try:
-            # Attempt to use the pattern as a regular expression.
             compiled_regex = re.compile(pattern, re.IGNORECASE)
             if compiled_regex.search(text_to_check):
                 return True
         except re.error:
-            # Fallback to simple case-insensitive substring matching if regex is invalid.
             if pattern.lower() in text_to_check.lower():
                 return True
         return False
@@ -417,7 +450,6 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         if not rule:
             return
 
-        # --- Filter Checks ---
         if not self._is_message_allowed_by_filters(message_object, rule):
             return
 
@@ -436,49 +468,31 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         self._send_forwarded_message(message_object, rule)
     
     def _get_java_len(self, py_string: str) -> int:
-        """
-        Calculates the length of a Python string using Java's UTF-16 length method.
-        This is crucial for creating accurate entities for text containing emojis.
-        """
         if not py_string:
             return 0
         return JavaString(py_string).length()
 
     def _add_user_entities(self, entities: ArrayList, text: str, user_entity: TLRPC.TL_user, display_name: str):
-        """
-        A helper method to add both Bold and TextUrl entities for a given user.
-        This creates a clickable, bold, colored link for a user's name.
-        """
         if not all([entities is not None, text, user_entity, display_name]):
             return
-        
         try:
             offset = text.rfind(display_name)
-            if offset == -1:
-                return
+            if offset == -1: return
 
             length = self._get_java_len(display_name)
             
             url_entity = TLRPC.TL_messageEntityTextUrl()
             url_entity.url = f"tg://user?id={user_entity.id}"
-            url_entity.offset = offset
-            url_entity.length = length
+            url_entity.offset, url_entity.length = offset, length
             entities.add(url_entity)
 
             bold_entity = TLRPC.TL_messageEntityBold()
-            bold_entity.offset = offset
-            bold_entity.length = length
+            bold_entity.offset, bold_entity.length = offset, length
             entities.add(bold_entity)
         except Exception as e:
             log(f"[{self.id}] Failed to add user entities for {display_name}: {e}")
 
     def _build_reply_quote(self, message_object):
-        """
-        Builds a native-style visual quote block for a replied-to message.
-        This function constructs the text and formatting entities needed to mimic
-        Telegram's reply quoting UI, handling emojis, code blocks, and other
-        edge cases.
-        """
         replied_message_obj = message_object.replyMessageObject
         if not replied_message_obj or not replied_message_obj.messageOwner:
             return None, None
@@ -489,20 +503,14 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         author_name = self._get_entity_name(author_entity)
         original_fwd_tag, _ = self._get_original_author_details(replied_message.fwd_from)
 
-        quote_snippet = ""
-        if replied_message_obj.isPhoto():
-            quote_snippet = "Photo"
-        elif replied_message_obj.isVideo():
-            quote_snippet = "Video"
-        elif replied_message_obj.isVoice():
-            quote_snippet = "Voice Message"
-        elif replied_message_obj.isSticker():
-            quote_snippet = str(replied_message_obj.messageText) if replied_message_obj.messageText else "Sticker"
+        quote_snippet = "Media"
+        if replied_message_obj.isPhoto(): quote_snippet = "Photo"
+        elif replied_message_obj.isVideo(): quote_snippet = "Video"
+        elif replied_message_obj.isVoice(): quote_snippet = "Voice Message"
+        elif replied_message_obj.isSticker(): quote_snippet = str(replied_message_obj.messageText) if replied_message_obj.messageText else "Sticker"
         elif replied_message and replied_message.message:
             raw_text = replied_message.message
             quote_snippet = re.sub(r'[\s\r\n]+', ' ', raw_text).strip()
-        else:
-            quote_snippet = "Media"
 
         if self._get_java_len(quote_snippet) > 44:
             quote_snippet = quote_snippet[:44].strip() + "..."
@@ -517,21 +525,17 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             self._add_user_entities(entities, quote_text, author_entity, author_name)
         else:
             bold_entity = TLRPC.TL_messageEntityBold()
-            bold_entity.offset = 0
-            bold_entity.length = self._get_java_len(author_name)
+            bold_entity.offset, bold_entity.length = 0, self._get_java_len(author_name)
             entities.add(bold_entity)
 
         quote_entity = TLRPC.TL_messageEntityBlockquote()
-        quote_entity.offset = 0
-        quote_entity.length = self._get_java_len(quote_text)
+        quote_entity.offset, quote_entity.length = 0, self._get_java_len(quote_text)
         entities.add(quote_entity)
 
         return quote_text, entities
 
     def _send_album(self, message_objects, rule):
-        """Constructs and sends an album, filtering each item and attaching a header/quote to the first."""
-        if not message_objects:
-            return
+        if not message_objects: return
         
         to_peer_id = rule["destination"]
         drop_author = rule.get("drop_author", True)
@@ -554,7 +558,6 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
                         album_entities = msg_obj.messageOwner.entities
                         break
 
-            # Apply keyword filter to the album caption
             if keyword_pattern and not self._passes_keyword_filter(album_caption, keyword_pattern):
                 return
 
@@ -593,7 +596,6 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
                             cached_message_obj = get_messages_controller().getMessage(original_message.dialog_id, original_message.id)
                             if cached_message_obj and self._is_media_complete(cached_message_obj.messageOwner):
                                 current_msg_obj = cached_message_obj
-                                log(f"[{self.id}] Refreshed incomplete album part {original_message.id} from cache.")
                     except Exception as e:
                         log(f"[{self.id}] Could not refresh album part from cache. Error: {e}")
 
@@ -627,7 +629,6 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             log(f"[{self.id}] ERROR in _send_album: {traceback.format_exc()}")
 
     def _send_forwarded_message(self, message_object, rule):
-        """Constructs and sends a single message."""
         message = message_object.messageOwner
         if not message: return
         
@@ -648,10 +649,8 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
                 author_entity = self._get_chat_entity(self._get_id_from_peer(message.from_id))
                 if source_entity:
                     header_text, header_entities = self._build_forward_header(message, source_entity, author_entity)
-                    if header_text:
-                        prefix_text += header_text
-                    if header_entities:
-                        prefix_entities.addAll(header_entities)
+                    if header_text: prefix_text += header_text
+                    if header_entities: prefix_entities.addAll(header_entities)
             
             if quote_replies:
                 quote_text, quote_entities = self._build_reply_quote(message_object)
@@ -670,8 +669,7 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             req = None
             if input_media:
                 req = TLRPC.TL_messages_sendMedia()
-                req.media = input_media
-                req.message = message_text
+                req.media, req.message = input_media, message_text
             elif message_text.strip():
                 req = TLRPC.TL_messages_sendMessage()
                 req.message = message_text
@@ -687,7 +685,6 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             log(f"[{self.id}] ERROR in _send_forwarded_message: {traceback.format_exc()}")
 
     def _get_input_media(self, message_object):
-        """Safely extracts forwardable media from a message object."""
         media = getattr(message_object.messageOwner, "media", None)
         if not media: return None
         try:
@@ -710,7 +707,6 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         return None
 
     def create_settings(self) -> list:
-        """Builds the plugin's settings page UI."""
         self._load_configurable_settings()
         self._load_forwarding_rules()
         settings_ui = [
@@ -745,11 +741,48 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             Text(text="USDT (TRC20)", icon="msg_copy", accent=True, on_click=lambda view: run_on_ui_thread(lambda: self._copy_to_clipboard(self.USDT_ADDRESS, "USDT"))),
             Divider(),
             Text(text="Disclaimer & FAQ", icon="msg_help", accent=True, on_click=lambda v: run_on_ui_thread(lambda: self._show_faq_dialog())),
+            Divider(),
+            Text(
+                text="Check for Updates",
+                icon="msg_update",
+                accent=True,
+                on_click=lambda v: self.check_for_updates(is_manual=True)
+            )
         ])
         return settings_ui
+    
+    def _process_changelog_markdown(self, text):
+        """Processes release notes from GitHub into displayable HTML with proper spacing."""
+        def process_inline(line):
+            line = re.sub(r'\[(.*?)\]\((.*?)\)', r'<a href="\2">\1</a>', line)
+            line = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', line)
+            line = re.sub(r'__(.*?)__', r'<u>\1</u>', line)
+            line = re.sub(r'~~(.*?)~~', r'<s>\1</s>', line)
+            line = re.sub(r'\*(.*?)\*', r'<i>\1</i>', line)
+            line = re.sub(r'`(.*?)`', r'<code>\1</code>', line)
+            return line
+
+        html_lines = []
+        for line in text.replace('\r', '').split('\n'):
+            stripped = line.strip()
+            
+            if not stripped:
+                html_lines.append("")
+                continue
+            
+            if stripped.startswith('### '):
+                html_lines.append(f"<b>{process_inline(stripped[4:])}</b>")
+            elif stripped.startswith('* '):
+                html_lines.append(f"•&nbsp;&nbsp;{process_inline(stripped[2:])}")
+            elif stripped.startswith('- '):
+                html_lines.append(f"&nbsp;&nbsp;-&nbsp;&nbsp;{process_inline(stripped[2:])}")
+            else:
+                html_lines.append(process_inline(stripped))
+        
+        html_text = '<br>'.join(html_lines)
+        return re.sub(r'(<br>\s*){2,}', '<br><br>', html_text)
 
     def _show_faq_dialog(self):
-        """Builds and displays the FAQ and Disclaimer in a themed, scrollable dialog."""
         activity = get_last_fragment().getParentActivity()
         if not activity: return
         try:
@@ -766,12 +799,12 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             faq_text_view = TextView(activity)
             
             def process_inline_markdown(text):
-                text = re.sub(r'\[(.*?)\]\((.*?)\)', r'<a href="\2">\1</a>', text) # Links
-                text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text) # Bold
-                text = re.sub(r'__(.*?)__', r'<u>\1</u>', text) # Underline
-                text = re.sub(r'~~(.*?)~~', r'<s>\1</s>', text) # Strikethrough
-                text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text) # Italics
-                text = re.sub(r'`(.*?)`', r'<tt>\1</tt>', text) # Monospace
+                text = re.sub(r'\[(.*?)\]\((.*?)\)', r'<a href="\2">\1</a>', text)
+                text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+                text = re.sub(r'__(.*?)__', r'<u>\1</u>', text)
+                text = re.sub(r'~~(.*?)~~', r'<s>\1</s>', text)
+                text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)
+                text = re.sub(r'`(.*?)`', r'<tt>\1</tt>', text)
                 return text
 
             accent_color_hex = f"#{Theme.getColor(Theme.key_dialogTextLink) & 0xFFFFFF:06x}"
@@ -783,12 +816,10 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             for i, line in enumerate(source_lines):
                 stripped_line = line.strip()
                 
-                # If the line is empty, it's a paragraph break.
                 if not stripped_line:
                     html_lines.append("")
                     continue
 
-                # Handle --- separator
                 if stripped_line == '---':
                     html_lines.append(f"<p align='center'><font color='{accent_color_hex}'>•&nbsp;•&nbsp;•</font></p>")
                     continue
@@ -807,10 +838,7 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
                 else:
                     html_lines.append(process_inline_markdown(content_spoilers_processed))
 
-            # Join with single line breaks. Paragraphs are now defined by empty strings in the list.
             html_text = '<br>'.join(html_lines)
-            
-            # Normalize paragraph breaks to a consistent double break for spacing
             html_text = re.sub(r'(<br>\s*){2,}', '<br><br>', html_text)
             
             if hasattr(Html, 'FROM_HTML_MODE_LEGACY'):
@@ -822,8 +850,6 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             faq_text_view.setMovementMethod(LinkMovementMethod.getInstance())
             faq_text_view.setLinkTextColor(Theme.getColor(Theme.key_dialogTextLink))
             faq_text_view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15)
-            
-            # Use a multiplier for nice spacing within paragraphs, not between them.
             faq_text_view.setLineSpacing(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 2.0, activity.getResources().getDisplayMetrics()), 1.2)
             
             layout.addView(faq_text_view)
@@ -1416,3 +1442,158 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
                 last_fragment.rebuildViews()
         except Exception:
             log(f"[{self.id}] ERROR during UI refresh: {traceback.format_exc()}")
+    
+    # --- Auto-Updater Methods ---
+
+    def _updater_loop(self):
+        """The main loop for the background updater thread."""
+        log(f"[{self.id}] Updater loop started.")
+        time.sleep(60) 
+        
+        while not self.stop_updater_thread.is_set():
+            self.check_for_updates(is_manual=False)
+            self.stop_updater_thread.wait(self.UPDATE_INTERVAL_SECONDS)
+        log(f"[{self.id}] Updater loop finished.")
+
+    def check_for_updates(self, is_manual=False):
+        """Public method to trigger an update check."""
+        if is_manual:
+            run_on_ui_thread(lambda: BulletinHelper.show_info("Checking for updates..."))
+        threading.Thread(target=self._perform_update_check, args=[is_manual]).start()
+
+    def _perform_update_check(self, is_manual):
+        """Connects to GitHub API and checks for a new version."""
+        try:
+            api_url = URL(f"https://api.github.com/repos/{self.GITHUB_OWNER}/{self.GITHUB_REPO}/releases/latest")
+            connection = api_url.openConnection()
+            connection.setRequestMethod("GET")
+            connection.connect()
+
+            if connection.getResponseCode() == HttpURLConnection.HTTP_OK:
+                stream = connection.getInputStream()
+                scanner = Scanner(stream, "UTF-8").useDelimiter("\\A")
+                response_str = scanner.next() if scanner.hasNext() else ""
+                scanner.close()
+                
+                release_data = json.loads(response_str)
+                latest_version_tag = release_data.get("tag_name", "0.0.0").lstrip('v')
+                current_version = __version__
+
+                latest_v_tuple = tuple(map(int, latest_version_tag.split('.')))
+                current_v_tuple = tuple(map(int, current_version.split('.')))
+
+                if latest_v_tuple > current_v_tuple:
+                    changelog = release_data.get("body", "No changelog provided.")
+                    assets = release_data.get("assets", [])
+                    download_url = None
+                    for asset in assets:
+                        if asset.get("name", "").endswith(".py"):
+                            download_url = asset.get("browser_download_url")
+                            break
+                    
+                    if download_url:
+                        run_on_ui_thread(lambda: self._show_update_dialog(latest_version_tag, changelog, download_url))
+                    elif is_manual:
+                        run_on_ui_thread(lambda: BulletinHelper.show_error("Update found, but no download file available."))
+                elif is_manual:
+                    run_on_ui_thread(lambda: BulletinHelper.show_info("You are on the latest version!", 2000))
+            elif is_manual:
+                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Failed to fetch updates (HTTP {connection.getResponseCode()})"))
+
+        except Exception as e:
+            log(f"[{self.id}] Update check failed: {traceback.format_exc()}")
+            if is_manual:
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Update check failed. See logs."))
+
+    def _show_update_dialog(self, version, changelog, download_url):
+        """Displays a dialog with the changelog and update/cancel buttons."""
+        activity = get_last_fragment().getParentActivity()
+        if not activity: return
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title(f"Update to v{version} available!")
+
+        margin_dp = 20
+        margin_px = int(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, margin_dp, activity.getResources().getDisplayMetrics()))
+        scroller = ScrollView(activity)
+        changelog_view = TextView(activity)
+        changelog_view.setPadding(margin_px, 0, margin_px, margin_px // 2)
+
+        html_text = self._process_changelog_markdown(changelog)
+        if hasattr(Html, 'FROM_HTML_MODE_LEGACY'):
+            changelog_view.setText(Html.fromHtml(html_text, Html.FROM_HTML_MODE_LEGACY))
+        else:
+            changelog_view.setText(Html.fromHtml(html_text))
+        
+        changelog_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        changelog_view.setLinkTextColor(Theme.getColor(Theme.key_dialogTextLink))
+        changelog_view.setMovementMethod(LinkMovementMethod.getInstance())
+        changelog_view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15)
+        scroller.addView(changelog_view)
+        builder.set_view(scroller)
+
+        on_update_click = lambda b, w: threading.Thread(target=self._download_and_install, args=[download_url, version]).start()
+        builder.set_positive_button("Update", on_update_click)
+        builder.set_negative_button("Cancel", None)
+        builder.show()
+
+    def _download_and_install(self, url, version):
+        """Downloads and installs the update seamlessly."""
+        try:
+            run_on_ui_thread(lambda: BulletinHelper.show_info(f"Downloading update v{version}..."))
+
+            download_url = URL(url)
+            connection = download_url.openConnection()
+            connection.connect()
+
+            if connection.getResponseCode() == HttpURLConnection.HTTP_OK:
+                plugins_controller = PluginsController.getInstance()
+                cache_dir = File(plugins_controller.pluginsDir, ".cache")
+                cache_dir.mkdirs()
+                
+                temp_file = File(cache_dir, f"temp_{self.id}_v{version}.py")
+
+                input_stream = connection.getInputStream()
+                output_stream = FileOutputStream(temp_file)
+                buffer = bytearray(4096)
+                bytes_read = input_stream.read(buffer)
+                while bytes_read != -1:
+                    output_stream.write(buffer, 0, bytes_read)
+                    bytes_read = input_stream.read(buffer)
+                output_stream.close()
+                input_stream.close()
+
+                log(f"[{self.id}] Download complete. Installing from {temp_file.getAbsolutePath()}")
+
+                def on_install_callback(error_msg):
+                    if error_msg:
+                        log(f"[{self.id}] Installation failed: {error_msg}")
+                        run_on_ui_thread(lambda: BulletinHelper.show_error(f"Update failed: {error_msg}"))
+                    else:
+                        log(f"[{self.id}] Update to v{version} successful! Closing settings page.")
+                        
+                        def close_settings_action():
+                            """Safely closes the current settings fragment."""
+                            fragment = get_last_fragment()
+                            if fragment and hasattr(fragment, 'finishFragment'):
+                                fragment.finishFragment()
+                
+                        # Button "DONE", the action to close the settings page.
+                        run_on_ui_thread(lambda: BulletinHelper.show_with_button(
+                            f"Update v{version} installed!",
+                            R.raw.chats_infotip,
+                            "DONE",
+                            lambda: close_settings_action()
+                        ))
+                    if temp_file.exists():
+                        temp_file.delete()
+                
+                install_callback_proxy = self.InstallCallback(on_install_callback)
+                plugins_controller.loadPluginFromFile(temp_file.getAbsolutePath(), install_callback_proxy)
+
+            else:
+                 run_on_ui_thread(lambda: BulletinHelper.show_error("Download failed."))
+        except Exception:
+            log(f"[{self.id}] Download and install failed: {traceback.format_exc()}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error("An error occurred during update."))
+
