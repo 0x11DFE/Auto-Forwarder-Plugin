@@ -77,7 +77,7 @@ __id__ = "auto_forwarder"
 __name__ = "Auto Forwarder"
 __description__ = "Sets up forwarding rules for any chat, including users, groups, and channels."
 __author__ = "@T3SL4"
-__version__ = "1.4.1"
+__version__ = "1.5.2"
 __min_version__ = "11.9.1"
 __icon__ = "Putin_1337/14"
 
@@ -102,12 +102,12 @@ FILTER_TYPES = {
     "stickers": "Stickers",
     "gifs": "GIFs & Animations"
 }
-FAQ_TEXT = """
---- **Disclaimer and Responsible Usage** ---
+FAQ_TEXT = """--- **Disclaimer and Responsible Usage** ---
 Please be aware that using a plugin like this automates actions on your personal Telegram account. This practice is often referred to as 'self-botting'.
 This kind of automation may be considered a violation of [Telegram's Terms of Service](https://telegram.org/tos), which can prohibit bot-like activity from user accounts.
 Using this plugin carries potential risks, including account limitations or bans. You accept full responsibility for your actions. The author is not responsible for any consequences from your use or misuse of this tool.
 **Use at your own risk.**
+
 --- **FAQ** ---
 **🚀 Core Functionality**
 * **How do I create a rule?**
@@ -120,11 +120,18 @@ When setting up a rule, you have a checkbox for "Remove Original Author".
 - **Unchecked (Forward Mode):** Performs a standard Telegram forward, including the "Forwarded from..." header, preserving the original author's context.
 * **Can I control which messages get forwarded?**
 Yes. When creating or modifying a rule, you can choose to forward messages from regular users, bots, and your own outgoing messages independently.
+
 --- **✨ Advanced Features & Formatting** ---
 * **How does the Anti-Spam Firewall work?**
 It's a rate-limiter that prevents a single user from flooding your destination chat. It works by enforcing a minimum time delay between forwards *from the same person*. You can configure this delay in the General Settings.
 * **How do the content filters work?**
 When creating or modifying a rule, you'll see checkboxes for different message types (Text, Photos, Videos, etc.). Simply uncheck any content type you *don't* want to be forwarded for that specific rule. For example, you can set up a rule to forward only photos and videos from a channel, ignoring all text messages.
+* **How does keyword/regex filtering work?**
+You can specify keywords or regex patterns that messages must contain to be forwarded. This works for text messages and media captions:
+- **Keywords:** Simple text matching (case-insensitive). Example: `"bitcoin"` will match messages containing "Bitcoin", "BITCOIN", etc.
+- **Regex Patterns:** Advanced pattern matching. Example: `"\\\\b(btc|bitcoin|₿)\\\\b"` will match whole words containing btc, bitcoin, or the bitcoin symbol.
+- **Leave the field empty** to disable keyword filtering (forward all messages that pass other filters).
+- If a regex pattern fails to compile, it will fall back to simple case-insensitive text matching.
 * **Does the plugin support text formatting (Markdown)?**
 Yes, completely. In 'Copy' mode, the plugin perfectly preserves all text formatting from the original message. This includes:
 - **Bold** and *italic* text
@@ -133,6 +140,7 @@ Yes, completely. In 'Copy' mode, the plugin perfectly preserves all text formatt
 - ||Spoilers||
 - [Custom Hyperlinks](https://telegram.org)
 - Mentions and #hashtags
+
 --- **⚙️ Technical Settings & Troubleshooting** ---
 * **What do the General Settings mean?**
 - **Min/Max Message Length:** Filters *text messages* based on their character count.
@@ -378,6 +386,23 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         if message_object.isDocument(): return filters.get("documents", True)
         return filters.get("text", True)
 
+    def _passes_keyword_filter(self, text_to_check, pattern):
+        """Checks if text matches a keyword/regex pattern, with a fallback."""
+        if not pattern:
+            return True
+        if not text_to_check:
+            return False
+        try:
+            # Attempt to use the pattern as a regular expression.
+            compiled_regex = re.compile(pattern, re.IGNORECASE)
+            if compiled_regex.search(text_to_check):
+                return True
+        except re.error:
+            # Fallback to simple case-insensitive substring matching if regex is invalid.
+            if pattern.lower() in text_to_check.lower():
+                return True
+        return False
+
     def _process_and_send(self, message_object, event_key):
         """Final processing stage that applies all filters and sends the message."""
         current_time = time.time()
@@ -392,9 +417,16 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         if not rule:
             return
 
+        # --- Filter Checks ---
         if not self._is_message_allowed_by_filters(message_object, rule):
             return
 
+        keyword_pattern = rule.get("keyword_pattern", "").strip()
+        if keyword_pattern:
+            text_to_check = message.message or ""
+            if not self._passes_keyword_filter(text_to_check, keyword_pattern):
+                return
+        
         is_text_based = not message.media or isinstance(message.media, (TLRPC.TL_messageMediaEmpty, TLRPC.TL_messageMediaWebPage))
         if is_text_based:
             if not (self.min_msg_length <= len(message.message or "") <= self.max_msg_length):
@@ -505,6 +537,7 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         drop_author = rule.get("drop_author", True)
         quote_replies = rule.get("quote_replies", True)
         filters = rule.get("filters", {})
+        keyword_pattern = rule.get("keyword_pattern", "").strip()
 
         try:
             req = TLRPC.TL_messages_sendMultiMedia()
@@ -520,6 +553,10 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
                         album_caption = msg_obj.messageOwner.message
                         album_entities = msg_obj.messageOwner.entities
                         break
+
+            # Apply keyword filter to the album caption
+            if keyword_pattern and not self._passes_keyword_filter(album_caption, keyword_pattern):
+                return
 
             first_message_obj = message_objects[0]
             first_message = first_message_obj.messageOwner
@@ -741,31 +778,41 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             spoiler_color_hex = f"#{Theme.getColor(Theme.key_windowBackgroundGray) & 0xFFFFFF:06x}"
             
             html_lines = []
-            for line in FAQ_TEXT.strip().split('\n'):
+            source_lines = FAQ_TEXT.strip().split('\n')
+
+            for i, line in enumerate(source_lines):
                 stripped_line = line.strip()
+                
+                # If the line is empty, it's a paragraph break.
                 if not stripped_line:
-                    html_lines.append('')
+                    html_lines.append("")
                     continue
+
+                # Handle --- separator
                 if stripped_line == '---':
                     html_lines.append(f"<p align='center'><font color='{accent_color_hex}'>•&nbsp;•&nbsp;•</font></p>")
                     continue
                 
                 content_spoilers_processed = re.sub(r'\|\|(.*?)\|\|', rf'<font style="background-color:{spoiler_color_hex};color:{spoiler_color_hex};">&nbsp;\1&nbsp;</font>', stripped_line)
                 
-                if stripped_line.startswith('* '):
-                    content_final = process_inline_markdown(content_spoilers_processed[2:])
-                    html_lines.append(f"&nbsp;&nbsp;•&nbsp;&nbsp;{content_final}")
-                elif re.match(r'^\*\*(.*)\*\*$', stripped_line):
+                if re.match(r'^\*\*(.*)\*\*$', stripped_line):
                     content = stripped_line.replace('**', '').strip()
-                    html_lines.append(f"<h4><font color='{accent_color_hex}'>{content}</font></h4>")
+                    html_lines.append(f"<b><font color='{accent_color_hex}'>{content}</font></b>")
+                elif stripped_line.startswith('* '):
+                    content_final = process_inline_markdown(content_spoilers_processed[2:])
+                    html_lines.append(f"&nbsp;&nbsp;•&nbsp;&nbsp;<b>{content_final}</b>")
+                elif stripped_line.startswith('- '):
+                    content_final = process_inline_markdown(content_spoilers_processed[2:])
+                    html_lines.append(f"&nbsp;&nbsp;&nbsp;&nbsp;-&nbsp;&nbsp;{content_final}")
                 else:
                     html_lines.append(process_inline_markdown(content_spoilers_processed))
-            
-            html_text = '<br>'.join(html_lines)
-            html_text = re.sub(r'(<br>){2,}', '<br>', html_text)
-            html_text = html_text.replace('<br><p', '<p').replace('</p><br>', '</p>')
-            html_text = html_text.replace('<br><h4', '<br><br><h4').strip()
 
+            # Join with single line breaks. Paragraphs are now defined by empty strings in the list.
+            html_text = '<br>'.join(html_lines)
+            
+            # Normalize paragraph breaks to a consistent double break for spacing
+            html_text = re.sub(r'(<br>\s*){2,}', '<br><br>', html_text)
+            
             if hasattr(Html, 'FROM_HTML_MODE_LEGACY'):
                 faq_text_view.setText(Html.fromHtml(html_text, Html.FROM_HTML_MODE_LEGACY))
             else:
@@ -775,7 +822,9 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             faq_text_view.setMovementMethod(LinkMovementMethod.getInstance())
             faq_text_view.setLinkTextColor(Theme.getColor(Theme.key_dialogTextLink))
             faq_text_view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15)
-            faq_text_view.setLineSpacing(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 2.0, activity.getResources().getDisplayMetrics()), 1.0)
+            
+            # Use a multiplier for nice spacing within paragraphs, not between them.
+            faq_text_view.setLineSpacing(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 2.0, activity.getResources().getDisplayMetrics()), 1.2)
             
             layout.addView(faq_text_view)
             scroller.addView(layout)
@@ -1037,11 +1086,20 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             input_field = EditText(activity)
             input_field_params = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
             input_field_params.setMargins(margin_px, margin_px // 2, margin_px, 0)
-            input_field.setHint("Link, @username, or ID")
+            input_field.setHint("Destination Link, @username, or ID")
             input_field.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
             input_field.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
             input_field.setLayoutParams(input_field_params)
             main_layout.addView(input_field)
+
+            keyword_filter_input = EditText(activity)
+            keyword_filter_input_params = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            keyword_filter_input_params.setMargins(margin_px, margin_px // 4, margin_px, margin_px // 2)
+            keyword_filter_input.setHint("Keyword/Regex Filter (optional)")
+            keyword_filter_input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            keyword_filter_input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
+            keyword_filter_input.setLayoutParams(keyword_filter_input_params)
+            main_layout.addView(keyword_filter_input)
             
             checkbox_tint_list = ColorStateList([[-16842912], [16842912]], [Theme.getColor(Theme.key_checkbox), Theme.getColor(Theme.key_checkboxCheck)])
             
@@ -1067,7 +1125,6 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             extra_left_margin_dp = 16 
             extra_left_margin_px = int(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, extra_left_margin_dp, activity.getResources().getDisplayMetrics()))
             
-            # Define a balanced vertical margin for the dividers.
             vertical_margin_dp = 12
             vertical_margin_px = int(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, vertical_margin_dp, activity.getResources().getDisplayMetrics()))
             divider_params.setMargins(margin_px + extra_left_margin_px, vertical_margin_px, margin_px, vertical_margin_px)
@@ -1141,6 +1198,7 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
                     identifier_to_set = f"@{dest_entity.username}"
                 input_field.setText(identifier_to_set)
                 
+                keyword_filter_input.setText(existing_rule.get("keyword_pattern", ""))
                 drop_author_checkbox.setChecked(existing_rule.get("drop_author", False))
                 quote_replies_checkbox.setChecked(existing_rule.get("quote_replies", True))
                 
@@ -1170,6 +1228,7 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
                     source_id,
                     source_name,
                     input_field.getText().toString(),
+                    keyword_filter_input.getText().toString(),
                     drop_author_checkbox.isChecked(),
                     quote_replies_checkbox.isChecked(),
                     forward_users_checkbox.isChecked(),
@@ -1184,13 +1243,14 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         except Exception:
             log(f"[{self.id}] ERROR showing rule setup dialog: {traceback.format_exc()}")
 
-    def _process_destination_input(self, source_id, source_name, user_input, drop_author, quote_replies, forward_users, forward_bots, forward_outgoing, filter_settings):
+    def _process_destination_input(self, source_id, source_name, user_input, keyword_pattern, drop_author, quote_replies, forward_users, forward_bots, forward_outgoing, filter_settings):
         """Handles all destination types with a multi-step resolution logic."""
         cleaned_input = (user_input or "").strip()
         if not cleaned_input: return
 
         # A dictionary to pass all the rule settings neatly.
         rule_settings = {
+            "keyword_pattern": keyword_pattern,
             "drop_author": drop_author,
             "quote_replies": quote_replies,
             "forward_users": forward_users,
@@ -1305,6 +1365,7 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         rule_data = {
             "destination": destination_id,
             "enabled": True,
+            "keyword_pattern": rule_settings["keyword_pattern"],
             "drop_author": rule_settings["drop_author"],
             "quote_replies": rule_settings["quote_replies"],
             "forward_users": rule_settings["forward_users"],
