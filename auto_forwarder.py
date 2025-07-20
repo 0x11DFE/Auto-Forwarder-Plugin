@@ -228,7 +228,6 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
         self._load_configurable_settings()
         self._load_forwarding_rules()
         self._add_chat_menu_item()
-        
         self.stop_updater_thread.clear()
         if self.updater_thread is None or not self.updater_thread.is_alive():
             self.updater_thread = threading.Thread(target=self._updater_loop)
@@ -236,18 +235,26 @@ class AutoForwarderPlugin(dynamic_proxy(NotificationCenter.NotificationCenterDel
             self.updater_thread.start()
             log(f"[{self.id}] Auto-updater thread started.")
 
-        account_instance = get_account_instance()
-        if account_instance:
-            account_instance.getNotificationCenter().addObserver(self, NotificationCenter.didReceiveNewMessages)
+        def register_observer():
+            account_instance = get_account_instance()
+            if account_instance:
+                account_instance.getNotificationCenter().addObserver(self, NotificationCenter.didReceiveNewMessages)
+                log(f"[{self.id}] Message observer successfully registered.")
+
+        run_on_ui_thread(register_observer)
 
     def on_plugin_unload(self):
         """Called when the plugin is unloaded. Removes the observer and cancels any pending tasks."""
         self.stop_updater_thread.set()
         log(f"[{self.id}] Auto-updater thread stopped.")
 
-        account_instance = get_account_instance()
-        if account_instance:
-            account_instance.getNotificationCenter().removeObserver(self, NotificationCenter.didReceiveNewMessages)
+        def unregister_observer():
+            account_instance = get_account_instance()
+            if account_instance:
+                account_instance.getNotificationCenter().removeObserver(self, NotificationCenter.didReceiveNewMessages)
+                log(f"[{self.id}] Message observer successfully removed.")
+
+        run_on_ui_thread(unregister_observer)
         self.handler.removeCallbacksAndMessages(None)
 
     def _load_configurable_settings(self):
