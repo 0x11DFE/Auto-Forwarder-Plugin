@@ -1,6 +1,6 @@
 # Auto Forwarder Plugin
 
-[![Version](https://img.shields.io/badge/version-1.6.4-blue.svg)](https://github.com/0x11DFE/Auto-Forwarder-Plugin/releases)
+[![Version](https://img.shields.io/badge/version-1.6.5-blue.svg)](https://github.com/0x11DFE/Auto-Forwarder-Plugin/releases)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Telegram](https://img.shields.io/badge/author-%40T3SL4-blue.svg)](https://t.me/T3SL4)
 
