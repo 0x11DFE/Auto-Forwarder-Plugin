@@ -1,6 +1,6 @@
 # Auto Forwarder Plugin
 
-[![Version](https://img.shields.io/badge/version-1.6.5-blue.svg)](https://github.com/0x11DFE/Auto-Forwarder-Plugin/releases)
+[![Version](https://img.shields.io/badge/version-1.7.7-blue.svg)](https://github.com/0x11DFE/Auto-Forwarder-Plugin/releases)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Telegram](https://img.shields.io/badge/author-%40T3SL4-blue.svg)](https://t.me/T3SL4)
 
@@ -36,25 +36,19 @@ An advanced plugin for **exteraGram** that gives you total control over message 
     * Get notified directly in the app when a new version is available on GitHub Releases.
     * View the official changelog in a pop-up dialog before updating.
     * Update with a single click—no manual downloads or installs required.
-    * Includes both automatic background checks and a manual check button.
 
 * **Two Powerful Forwarding Modes:**
-    * **Copy Mode:** Sends a brand new message, making it look like you sent it yourself. This mode enables:
-        * **Perfect Formatting:** Preserves **bold**, *italic*, `monospace`, ~~strikethrough~~, ||spoilers||, and [hyperlinks](https://telegram.org).
-        * **Reply Quoting:** Automatically recreates the replied-to message as a visual quote block.
+    * **Copy Mode:** Sends a brand new message, making it look like you sent it yourself. This mode enables perfect formatting preservation and automatically recreated reply quotes.
     * **Header Mode (Simulated Forward):** Copies the message and prepends a custom, clickable "Forwarded from..." header, linking to the original author and chat.
 
-* **Keyword & Regex Filtering:**
-    * Create rules that only forward messages or media captions containing specific keywords or matching a regular expression.
-    * Features a case-insensitive, fallback search for invalid regex patterns.
+* **Advanced Filtering Engine:**
+    * **Keyword & Regex:** Forward messages, media captions, or **documents with filenames** that contain specific keywords or match a regular expression.
+    * **Granular Content Control:** The "Text" filter is now split into "Text Messages" and "Media Captions," allowing you to forward media while stripping its caption, and vice-versa.
+    * **Author Whitelisting:** Filter messages based on the author type (Users, Bots, Outgoing), or provide a specific, comma-separated list of User IDs or `@usernames` to exclusively forward messages *only* from them.
 
-* **Advanced Content Filtering:**
-    * For each rule, precisely select which types of content to forward (Text, Photos, Videos, Documents, Stickers, etc.).
-    * Filter messages based on the author (Users, Bots, or your own Outgoing messages).
-
-* **Intelligent Buffering & Anti-Spam:**
+* **Intelligent & Reliable Processing:**
     * **Album Handling:** Automatically waits to collect all photos/videos in a gallery before sending them together as a single album.
-    * **Media Deferral:** Includes a safety net for large or slow-to-download media, retrying to ensure files are forwarded reliably.
+    * **Duplicate File Prevention:** Avoids re-forwarding the same file if it's sent by the same user multiple times in a short period.
     * **Anti-Spam Firewall:** A built-in rate-limiter prevents a single user from flooding your destination chat with rapid messages.
 
 
@@ -77,7 +71,7 @@ This plugin is configured entirely through the Telegram user interface.
 2.  Tap the three-dots menu (**⋮**) in the top-right corner.
 3.  Select **Auto Forward...** from the menu.
 4.  A dialog will appear. Enter the destination chat's ID, @username, or private `t.me/joinchat/...` link.
-5.  Configure the options (like Copy/Header mode, content filters, and keyword filters).
+5.  Configure the options, such as Copy/Header mode, content filters, keyword matching, and specific author whitelists.
 6.  Tap **Set** to save the rule.
 
 ### Editing or Deleting a Rule
