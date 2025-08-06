@@ -1,6 +1,6 @@
 # Auto Forwarder Plugin
 
-[![Version](https://img.shields.io/badge/version-1.7.7-blue.svg)](https://github.com/0x11DFE/Auto-Forwarder-Plugin/releases)
+[![Version](https://img.shields.io/badge/version-1.8.0-blue.svg)](https://github.com/0x11DFE/Auto-Forwarder-Plugin/releases)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Telegram](https://img.shields.io/badge/author-%40T3SL4-blue.svg)](https://t.me/T3SL4)
 
@@ -31,6 +31,10 @@ An advanced plugin for **exteraGram** that gives you total control over message 
 
 
 ## ✨ Features
+
+* **Effortless Destination & Topic Setup:**
+    * **Set by Replying:** The easiest way to set up a rule. Simply tap "Set by Replying" in the rule dialog, then go to your destination chat and reply to *any* message with the word `set`. The plugin handles the rest.
+    * **Full Topic Support:** Automatically forward messages directly into a specific topic in a group or a comment thread in a channel. The "Set by Replying" feature makes this seamless.
 
 * **Seamless Auto-Updater:**
     * Get notified directly in the app when a new version is available on GitHub Releases.
@@ -66,13 +70,21 @@ An advanced plugin for **exteraGram** that gives you total control over message 
 
 This plugin is configured entirely through the Telegram user interface.
 
-### Creating a Rule
+### Creating a Rule (The Easy Way)
 1.  Go into the chat you want to forward messages **from**.
-2.  Tap the three-dots menu (**⋮**) in the top-right corner.
-3.  Select **Auto Forward...** from the menu.
-4.  A dialog will appear. Enter the destination chat's ID, @username, or private `t.me/joinchat/...` link.
-5.  Configure the options, such as Copy/Header mode, content filters, keyword matching, and specific author whitelists.
-6.  Tap **Set** to save the rule.
+2.  Tap the three-dots menu (**⋮**) in the top-right corner and select **Auto Forward...**.
+3.  In the rule setup dialog, tap the **"Set by Replying"** button.
+4.  A prompt will appear. Click **Proceed**.
+5.  Navigate to your desired destination chat. This can be a user, group, channel, or even a specific **topic/comment thread**.
+6.  **Reply** to any message in that destination with the exact word: `set`
+7.  The plugin will instantly configure the rule and delete your `set` message. You're done!
+
+### Creating a Rule (Manual Method)
+1.  Go into the chat you want to forward messages **from**.
+2.  Tap the three-dots menu (**⋮**) in the top-right corner and select **Auto Forward...**.
+3.  A dialog will appear. Manually enter the destination chat's ID, @username, or private `t.me/joinchat/...` link.
+4.  Configure the other options, such as content filters, keyword matching, and specific author whitelists.
+5.  Tap **Set** to save the rule.
 
 ### Editing or Deleting a Rule
 1.  Go into a chat that already has an active forwarding rule.
@@ -101,4 +113,4 @@ If you find this plugin useful, please consider supporting its development. Than
 
 ## 📜 License
 
-This project is licensed under the **GNU General Public License v3.0**. See the [LICENSE](https://www.gnu.org/licenses/gpl-3.0.html) file for the full license text.
+This project is licensed under the **GNU General Public License v3.0**. See the [LICENSE](https://www.gnu.org/licenses/gpl-3.0.html) for the full license text.
