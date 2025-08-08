@@ -1,10 +1,10 @@
 # Auto Forwarder Plugin
 
-[![Version](https://img.shields.io/badge/version-1.8.0-blue.svg)](https://github.com/0x11DFE/Auto-Forwarder-Plugin/releases)
+[![Version](https://img.shields.io/badge/version-1.9.0-blue.svg)](https://github.com/0x11DFE/Auto-Forwarder-Plugin/releases)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Telegram](https://img.shields.io/badge/author-%40T3SL4-blue.svg)](https://t.me/T3SL4)
 
-An advanced plugin for **exteraGram** that gives you total control over message forwarding. Automatically copy or forward messages from any chat to another with powerful filters, an integrated auto-updater, and perfect format preservation.
+An advanced plugin for **exteraGram** that gives you total control over message forwarding. Automatically copy or forward messages from any chat to another with powerful filters, an integrated auto-updater, and a robust engine for reliable, ordered delivery.
 
 > [!WARNING]
 > ### 🔐 Disclaimer – Read Before Using
@@ -32,6 +32,10 @@ An advanced plugin for **exteraGram** that gives you total control over message 
 
 ## ✨ Features
 
+* **🚀 Reliable, Ordered Forwarding:**
+    * **Sequential Processing Engine:** A completely new architecture that processes messages one-by-one in a dedicated queue. This resolves race conditions and **guarantees that messages are forwarded in the exact order they are received.**
+    * **Configurable Speed vs. Order:** The new `Sequential Delay (Seconds)` setting gives you direct control over the trade-off. A small delay ensures order for large batches of files, while setting it to `0` restores high-speed parallel processing (which may result in messages being forwarded out of order).
+
 * **Effortless Destination & Topic Setup:**
     * **Set by Replying:** The easiest way to set up a rule. Simply tap "Set by Replying" in the rule dialog, then go to your destination chat and reply to *any* message with the word `set`. The plugin handles the rest.
     * **Full Topic Support:** Automatically forward messages directly into a specific topic in a group or a comment thread in a channel. The "Set by Replying" feature makes this seamless.
@@ -51,8 +55,8 @@ An advanced plugin for **exteraGram** that gives you total control over message 
     * **Author Whitelisting:** Filter messages based on the author type (Users, Bots, Outgoing), or provide a specific, comma-separated list of User IDs or `@usernames` to exclusively forward messages *only* from them.
 
 * **Intelligent & Reliable Processing:**
-    * **Album Handling:** Automatically waits to collect all photos/videos in a gallery before sending them together as a single album.
-    * **Duplicate File Prevention:** Avoids re-forwarding the same file if it's sent by the same user multiple times in a short period.
+    * **Ordered Album Handling:** Automatically waits to collect all photos/videos in a gallery before sending them together as a single, correctly ordered album.
+    * **Duplicate Notification Prevention:** A thread-safe deduplication system prevents client-side notification glitches from causing the same message to be forwarded multiple times.
     * **Anti-Spam Firewall:** A built-in rate-limiter prevents a single user from flooding your destination chat with rapid messages.
 
 
@@ -96,6 +100,11 @@ This plugin is configured entirely through the Telegram user interface.
 All global settings and a list of all active rules can be found by going to:
 `Settings > exteraGram Settings > Plugins > Auto Forwarder`
 
+Key settings include:
+- **Album Buffering Timeout (ms):** How long to wait to collect all media in an album.
+- **Sequential Delay (Seconds):** The pause between each message to guarantee order. Set to `0` to restore high-speed parallel mode (order not guaranteed).
+- **Deduplication Window (Seconds):** Time window to ignore duplicate notifications from the client.
+
 At the bottom of this page, you will also find the **"Check for Updates"** button.
 
 
@@ -107,8 +116,8 @@ Contributions, issues, and feature requests are welcome! Feel free to check the 
 
 If you find this plugin useful, please consider supporting its development. Thank you!
 
-* **TON:** ``UQDx2lC9bQW3A4LAfP4lSqtSftQSnLczt87Kn_CIcmJhLicm``
-* **USDT (TRC20):** ``TXLJNebRRAhwBRKtELMHJPNMtTZYHeoYBo``
+* **TON:** `UQDx2lC9bQW3A4LAfP4lSqtSftQSnLczt87Kn_CIcmJhLicm`
+* **USDT (TRC20):** `TXLJNebRRAhwBRKtELMHJPNMtTZYHeoYBo`
 
 
 ## 📜 License
