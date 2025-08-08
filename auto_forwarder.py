@@ -34,6 +34,7 @@ import time
 import re
 import os
 import threading
+import queue
 
 # --- Chaquopy Import for Java Interoperability ---
 from java.chaquopy import dynamic_proxy
@@ -82,7 +83,7 @@ __id__ = "auto_forwarder"
 __name__ = "Auto Forwarder"
 __description__ = "Sets up forwarding rules for any chat, including users, groups, and channels."
 __author__ = "@T3SL4"
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 __min_version__ = "11.9.1"
 __icon__ = "Putin_1337/14"
 
@@ -94,6 +95,7 @@ DEFAULT_SETTINGS = {
     "max_msg_length": 4096,
     "deduplication_window_seconds": 10.0,
     "album_timeout_ms": 800,
+    "sequential_delay_seconds": 1.5,
     "antispam_delay_seconds": 1.0
 }
 FILTER_TYPES = collections.OrderedDict([
@@ -156,8 +158,9 @@ Yes, completely. The plugin perfectly preserves all text formatting from the ori
 - **Min/Max Message Length:** Filters *text messages* based on their character count.
 - **Media Deferral Timeout:** A safety net for media files. When a file arrives, your app might need a moment to get the data required for forwarding. This is how long the plugin waits. Increase this value if large files you receive sometimes fail to forward.
 - **Album Buffering Timeout:** When a gallery of photos/videos is sent, the plugin waits a brief moment to collect all the images before forwarding them together as a single album. This controls that waiting period.
-- **Deduplication Window:** Prevents double-forwards. If Telegram sends a duplicate notification for the same message within this time window (in seconds), the plugin will ignore it. This window is also used for the new file name deduplication feature.
-- **Anti-Spam Delay:** The core setting for the firewall, as explained above. Set to `0` to disable it.
+- **Sequential Delay:** The core setting for ordered forwarding. It's the pause between each sent message to enforce a strict sequence. Set to 0 to disable and restore high-speed parallel forwarding (which may break order).
+- **Deduplication Window:** Prevents double-forwards from client notification glitches. If Telegram sends a duplicate notification for the same message within this time window (in seconds), the plugin will ignore it.
+- **Anti-Spam Delay:** The secondary rate-limiter. Set to `0` unless you need to slow down forwards from a specific user.
 * **Why do large files I send myself sometimes fail to forward?**
 This is a known limitation. If your file takes longer to upload than the "Media Deferral Timeout", the plugin may not be able to forward it. The feature is most reliable for forwarding messages you receive or for your own small files that upload instantly.
 """
@@ -183,7 +186,9 @@ class AlbumTask(dynamic_proxy(Runnable)):
         self.grouped_id = grouped_id
 
     def run(self):
-        self.plugin._process_album(self.grouped_id)
+        # Instead of processing, just put a reference to the complete album on the queue.
+        # The worker will pick it up and process it in the correct sequential order.
+        self.plugin.processing_queue.put(("album", self.grouped_id))
 
 # --- Main Plugin Class ---
 
@@ -231,6 +236,7 @@ class AutoForwarderPlugin(BasePlugin):
         """Initializes the plugin's state and properties."""
         super().__init__()
         self.id = __id__
+        self.lock = threading.Lock()
         self.forwarding_rules = {}
         self.error_message = None
         self.deferred_messages = {}
@@ -239,15 +245,18 @@ class AutoForwarderPlugin(BasePlugin):
         self.handler = Handler(Looper.getMainLooper())
         self.user_last_message_time = collections.OrderedDict()
         self.processed_files_cache = collections.OrderedDict()
+        
+        self.processing_queue = queue.Queue()
+        self.worker_thread = None
+        self.stop_worker_thread = threading.Event()
+        
         self.updater_thread = None
         self.stop_updater_thread = threading.Event()
         
-        # State for the "Set by Replying" feature
         self.is_listening_for_reply = False
         self.reply_listener_context = {}
         self.reply_listener_timeout_task = None
         
-        # This holds our dedicated listener object to prevent lifecycle crashes.
         self.message_listener = None
 
         self._load_configurable_settings()
@@ -256,8 +265,6 @@ class AutoForwarderPlugin(BasePlugin):
     class MessageListener(dynamic_proxy(NotificationCenter.NotificationCenterDelegate)):
         """
         A dedicated listener class to handle notifications from NotificationCenter.
-        This isolates the listener from the main plugin object's lifecycle,
-        preventing "PyObject is closed" errors during plugin reloads.
         """
         def __init__(self, plugin_instance):
             """Initializes the listener with a reference to the main plugin."""
@@ -276,9 +283,7 @@ class AutoForwarderPlugin(BasePlugin):
                 for i in range(messages_list.size()):
                     msg_obj = messages_list.get(i)
                     msg = msg_obj.messageOwner
-                    # Check for an outgoing reply with the trigger word 'set'.
                     if msg and msg.out and msg.message and msg.message.lower() == 'set':
-                        # Defines a runnable task to process the trigger after a short delay.
                         class ProcessReplyRunnable(dynamic_proxy(Runnable)):
                             def __init__(self, plugin, message_object):
                                 super().__init__()
@@ -287,9 +292,6 @@ class AutoForwarderPlugin(BasePlugin):
                             def run(self):
                                 self.plugin._process_reply_trigger(self.message_object)
                         
-                        # We delay processing by 1.5 seconds. This is crucial to prevent a "race condition"
-                        # where the plugin tries to delete the 'set' message before the server has
-                        # confirmed it, which would cause the message to reappear.
                         self.plugin.handler.postDelayed(ProcessReplyRunnable(self.plugin, msg_obj), 1500)
             
             # --- REGULAR MESSAGE FORWARDING LOGIC ---
@@ -300,7 +302,7 @@ class AutoForwarderPlugin(BasePlugin):
                     message_object = messages_list.get(i)
                     if not (hasattr(message_object, 'messageOwner') and message_object.messageOwner):
                         continue
-                    # Pass the event to the main handler in the plugin.
+                    # The triage center decides what to do with the message
                     self.plugin.handle_message_event(message_object)
             except Exception:
                 log(f"[{self.plugin.id}] ERROR in notification handler: {traceback.format_exc()}")
@@ -312,6 +314,13 @@ class AutoForwarderPlugin(BasePlugin):
         self._load_configurable_settings()
         self._load_forwarding_rules()
         self._add_chat_menu_item()
+
+        self.stop_worker_thread.clear()
+        if self.worker_thread is None or not self.worker_thread.is_alive():
+            self.worker_thread = threading.Thread(target=self._worker_loop)
+            self.worker_thread.daemon = True
+            self.worker_thread.start()
+            
         self.stop_updater_thread.clear()
         if self.updater_thread is None or not self.updater_thread.is_alive():
             self.updater_thread = threading.Thread(target=self._updater_loop)
@@ -322,7 +331,6 @@ class AutoForwarderPlugin(BasePlugin):
         def register_observer():
             account_instance = get_account_instance()
             if account_instance:
-                # Create and register the dedicated listener object.
                 self.message_listener = self.MessageListener(self)
                 account_instance.getNotificationCenter().addObserver(self.message_listener, NotificationCenter.didReceiveNewMessages)
                 log(f"[{self.id}] Message observer successfully registered.")
@@ -331,12 +339,14 @@ class AutoForwarderPlugin(BasePlugin):
 
     def on_plugin_unload(self):
         """Called when the plugin is unloaded."""
+        self.stop_worker_thread.set()
+        self.processing_queue.put(None) # Unblock the worker's get() call
+        
         self.stop_updater_thread.set()
         log(f"[{self.id}] Auto-updater thread stopped.")
 
         def unregister_observer():
             account_instance = get_account_instance()
-            # Unregister the specific listener object if it exists to prevent memory leaks.
             if account_instance and self.message_listener:
                 account_instance.getNotificationCenter().removeObserver(self.message_listener, NotificationCenter.didReceiveNewMessages)
                 self.message_listener = None
@@ -354,6 +364,7 @@ class AutoForwarderPlugin(BasePlugin):
         self.deferral_timeout_ms = int(self.get_setting("deferral_timeout_ms", str(DEFAULT_SETTINGS["deferral_timeout_ms"])))
         self.album_timeout_ms = int(self.get_setting("album_timeout_ms", str(DEFAULT_SETTINGS["album_timeout_ms"])))
         self.deduplication_window_seconds = float(self.get_setting("deduplication_window_seconds", str(DEFAULT_SETTINGS["deduplication_window_seconds"])))
+        self.sequential_delay_seconds = float(self.get_setting("sequential_delay_seconds", str(DEFAULT_SETTINGS["sequential_delay_seconds"])))
         self.antispam_delay_seconds = float(self.get_setting("antispam_delay_seconds", str(DEFAULT_SETTINGS["antispam_delay_seconds"])))
 
     def _load_forwarding_rules(self):
@@ -367,10 +378,68 @@ class AutoForwarderPlugin(BasePlugin):
     def _save_forwarding_rules(self):
         """Saves all forwarding rules to JSON storage."""
         self.set_setting(FORWARDING_RULES_KEY, json.dumps({str(k): v for k, v in self.forwarding_rules.items()}))
-        self._load_forwarding_rules() # Reload to ensure consistency
+        self._load_forwarding_rules()
 
-    # --- Core Logic & Event Handling ---
+    # --- Core Logic: Sequential Processing ---
+    def _worker_loop(self):
+        """
+        A dedicated worker thread that processes messages one by one from a queue
+        to ensure sequential ordering.
+        """
+        log(f"[{self.id}] Sequential worker thread started.")
+        while not self.stop_worker_thread.is_set():
+            try:
+                item = self.processing_queue.get(timeout=1)
+                
+                if item is None:
+                    break
+
+                if isinstance(item, tuple) and item[0] == "album":
+                    _, grouped_id = item
+                    self._process_album(grouped_id)
+                else:
+                    message_object = item
+                    self.super_handle_message_event(message_object)
+                
+                # If sequential delay is enabled, pause between each processed item.
+                if self.sequential_delay_seconds > 0:
+                    time.sleep(self.sequential_delay_seconds)
+                
+                self.processing_queue.task_done()
+
+            except queue.Empty:
+                continue
+            except Exception:
+                log(f"[{self.id}] ERROR in worker thread: {traceback.format_exc()}")
+                
+        log(f"[{self.id}] Sequential worker thread stopped.")
+
     def handle_message_event(self, message_object):
+        """
+        This function is the triage center. It groups albums together BEFORE
+        putting them on the sequential processing queue.
+        """
+        source_chat_id = self._get_id_from_peer(message_object.messageOwner.peer_id)
+        rule = self.forwarding_rules.get(source_chat_id)
+        if not rule or not rule.get("enabled", False):
+            return
+            
+        message = message_object.messageOwner
+        grouped_id = getattr(message, 'grouped_id', 0)
+
+        if grouped_id != 0:
+            with self.lock:
+                if grouped_id not in self.album_buffer:
+                    log(f"[{self.id}] Triage: Detected start of new album: {grouped_id}")
+                    album_task = AlbumTask(self, grouped_id)
+                    self.album_buffer[grouped_id] = {'messages': [], 'task': album_task}
+                    self.handler.postDelayed(album_task, self.album_timeout_ms)
+                
+                self.album_buffer[grouped_id]['messages'].append(message_object)
+        else:
+            self.processing_queue.put(message_object)
+            
+    def super_handle_message_event(self, message_object):
         """
         The main handler for processing a single incoming message object.
         It applies all filters and rules before deciding to forward.
@@ -378,16 +447,31 @@ class AutoForwarderPlugin(BasePlugin):
         message = message_object.messageOwner
         source_chat_id = self._get_id_from_peer(message.peer_id)
         rule = self.forwarding_rules.get(source_chat_id)
-        if not rule or not rule.get("enabled", False):
-            return
 
-        # 1. Filter by author type (user, bot, outgoing)
+        with self.lock:
+            event_key = None
+            if message.out:
+                event_key = ("outgoing", message.random_id)
+            else:
+                event_key = (source_chat_id, message.id)
+
+            current_time = time.time()
+            while self.processed_keys and current_time - self.processed_keys[0][1] > self.deduplication_window_seconds:
+                self.processed_keys.popleft()
+
+            if any(key == event_key for key, ts in self.processed_keys):
+                log(f"[{self.id}] Deduplicating event via lock, ignoring: {event_key}")
+                return
+
+            self.processed_keys.append((event_key, current_time))
+
+        # Filter by author type
         author_type = self._get_author_type(message)
         if author_type == "outgoing" and not rule.get("forward_outgoing", True): return
         if author_type == "user" and not rule.get("forward_users", True): return
         if author_type == "bot" and not rule.get("forward_bots", True): return
 
-        # 2. Filter by specific author usernames or IDs
+        # Filter by specific author
         author_filter = rule.get("author_filter", "").strip()
         if author_filter and (author_type == "user" or author_type == "bot"):
             author_id = self._get_id_from_peer(message.from_id)
@@ -400,43 +484,10 @@ class AutoForwarderPlugin(BasePlugin):
                 if author_entity.username.lower() in allowed_authors:
                     match_found = True
             if not match_found:
-                log(f"[{self.id}] Dropping message from '{self._get_entity_name(author_entity)}' because it doesn't match author filter: '{author_filter}'")
+                log(f"[{self.id}] Dropping message from '{self._get_entity_name(author_entity)}' due to author filter.")
                 return
 
-        # 3. Deduplicate based on filename to prevent spam
-        if message_object.isDocument():
-            doc = getattr(message.media, 'document', None)
-            filename = self._get_document_filename(doc)
-            if filename:
-                author_id = get_user_config().getClientUserId() if message.out else self._get_id_from_peer(message.from_id)
-                file_key = (author_id, filename)
-                current_time = time.time()
-                # Clean up old entries from the cache
-                while self.processed_files_cache:
-                    key, ts = next(iter(self.processed_files_cache.items()))
-                    if current_time - ts > self.deduplication_window_seconds:
-                        self.processed_files_cache.popitem(last=False)
-                    else:
-                        break
-                if file_key in self.processed_files_cache:
-                    log(f"[{self.id}] Deduplicating file '{filename}' from user {author_id} sent within the time window.")
-                    return
-                self.processed_files_cache[file_key] = current_time
-                if len(self.processed_files_cache) > self.PROCESSED_FILES_CACHE_SIZE:
-                    self.processed_files_cache.popitem(last=False)
-
-        # 4. Handle albums by buffering them
-        grouped_id = getattr(message, 'grouped_id', 0)
-        if grouped_id != 0:
-            if grouped_id not in self.album_buffer:
-                log(f"[{self.id}] Detected start of new album: {grouped_id}")
-                album_task = AlbumTask(self, grouped_id)
-                self.album_buffer[grouped_id] = {'messages': [], 'task': album_task}
-                self.handler.postDelayed(album_task, self.album_timeout_ms)
-            self.album_buffer[grouped_id]['messages'].append(message_object)
-            return
-
-        # 5. Apply anti-spam delay
+        # Apply anti-spam rate limit
         if self.antispam_delay_seconds > 0:
             author_id = get_user_config().getClientUserId() if message.out else self._get_id_from_peer(message.from_id)
             if author_id:
@@ -449,17 +500,7 @@ class AutoForwarderPlugin(BasePlugin):
                 if len(self.user_last_message_time) > self.USER_TIMESTAMP_CACHE_SIZE:
                     self.user_last_message_time.popitem(last=False)
 
-        # 6. Deduplicate based on message event key
-        event_key = None
-        if message.out:
-            event_key = ("outgoing", message.dialog_id, message.date, message.message or "")
-        else:
-            author_id = self._get_id_from_peer(message.from_id)
-            event_key = ("incoming", author_id, source_chat_id, message.id)
-        if any(key == event_key for key, ts in self.processed_keys):
-            return
-
-        # 7. Defer forwarding if media is incomplete or reply object is missing
+        # Defer forwarding if media is incomplete or reply object is missing
         is_media = hasattr(message, 'media') and message.media and not isinstance(message.media, TLRPC.TL_messageMediaEmpty)
         is_incomplete_media = is_media and not self._is_media_complete(message)
         is_reply = hasattr(message, 'reply_to') and message.reply_to is not None
@@ -473,33 +514,17 @@ class AutoForwarderPlugin(BasePlugin):
                 self.handler.postDelayed(deferred_task, self.deferral_timeout_ms)
             return
 
-        # If this message was previously deferred, cancel the timeout task
         if event_key in self.deferred_messages:
             _, deferred_task = self.deferred_messages[event_key]
             self.handler.removeCallbacks(deferred_task)
             del self.deferred_messages[event_key]
         
-        # 8. If all checks pass, proceed to sending
         self._process_and_send(message_object, rule)
 
     def _process_and_send(self, message_object, rule):
         """Performs final content checks and sends the message."""
         message = message_object.messageOwner
-        source_chat_id = self._get_id_from_peer(message.peer_id)
         
-        # Create a unique key for deduplication
-        if message.out:
-            event_key = ("outgoing", message.dialog_id, message.date, message.message or "")
-        else:
-            author_id = self._get_id_from_peer(message.from_id)
-            event_key = ("incoming", author_id, source_chat_id, message.id)
-
-        current_time = time.time()
-        while self.processed_keys and current_time - self.processed_keys[0][1] > self.deduplication_window_seconds:
-            self.processed_keys.popleft()
-        if any(key == event_key for key, ts in self.processed_keys):
-            return
-
         # Filter by content type (text, photo, etc.)
         if not self._is_message_allowed_by_filters(message_object, rule):
             return
@@ -522,8 +547,6 @@ class AutoForwarderPlugin(BasePlugin):
             if not (self.min_msg_length <= len(message.message or "") <= self.max_msg_length):
                 return
 
-        # Mark as processed and send
-        self.processed_keys.append((event_key, time.time()))
         self._send_forwarded_message(message_object, rule)
     
     def _process_timed_out_message(self, event_key):
@@ -531,8 +554,6 @@ class AutoForwarderPlugin(BasePlugin):
         if event_key in self.deferred_messages:
             log(f"[{self.id}] Processing deferred message after timeout. Key: {event_key}")
             message_object, _ = self.deferred_messages[event_key]
-            # The getMessage() method doesn't exist, so we removed the attempt
-            # to re-fetch from cache and will proceed with the object we have.
             source_chat_id = self._get_id_from_peer(message_object.messageOwner.peer_id)
             rule = self.forwarding_rules.get(source_chat_id)
             if rule:
@@ -546,6 +567,8 @@ class AutoForwarderPlugin(BasePlugin):
         if not album_data or not album_data['messages']:
             return
         
+        album_data['messages'].sort(key=lambda m: m.messageOwner.id)
+        
         first_message_obj = album_data['messages'][0]
         first_message = first_message_obj.messageOwner
         source_chat_id = self._get_id_from_peer(first_message.peer_id)
@@ -553,14 +576,6 @@ class AutoForwarderPlugin(BasePlugin):
         if not rule:
             return
 
-        # Deduplicate the entire album
-        album_key = (self._get_id_from_peer(first_message.from_id), source_chat_id, grouped_id)
-        current_time = time.time()
-        while self.processed_keys and current_time - self.processed_keys[0][1] > self.deduplication_window_seconds:
-            self.processed_keys.popleft()
-        if any(key == album_key for key, ts in self.processed_keys):
-            return
-        self.processed_keys.append((album_key, time.time()))
         self._send_album(album_data['messages'], rule)
 
     # --- Message Sending and Formatting ---
@@ -588,7 +603,6 @@ class AutoForwarderPlugin(BasePlugin):
                     original_text = message.message
             original_entities = message.entities if original_text else None
 
-            # Build the prefix (forward header, quoted reply)
             prefix_text, prefix_entities = "", ArrayList()
             if not drop_author:
                 source_entity = self._get_chat_entity(self._get_id_from_peer(message.peer_id))
@@ -609,11 +623,9 @@ class AutoForwarderPlugin(BasePlugin):
                         prefix_entities.addAll(quote_entities)
                     prefix_text += quote_text
             
-            # Combine prefix with the original message content
             message_text = f"{prefix_text}\n\n{original_text}".strip()
             entities = self._prepare_final_entities(prefix_text, prefix_entities, original_entities)
 
-            # Build the appropriate request based on content
             req = None
             if input_media:
                 req = TLRPC.TL_messages_sendMedia()
@@ -625,14 +637,13 @@ class AutoForwarderPlugin(BasePlugin):
             if req:
                 req.peer = get_messages_controller().getInputPeer(to_peer_id)
                 req.random_id = random.getrandbits(63)
-                # Add topic/reply info if applicable
                 if topic_id > 0:
                     req.reply_to = TLRPC.TL_inputReplyToMessage()
                     req.reply_to.reply_to_msg_id = topic_id
-                    req.flags |= 1 # Set the has_reply_to flag
+                    req.flags |= 1
                 if entities and not entities.isEmpty():
                     req.entities = entities
-                    req.flags |= 8 # Set the has_entities flag
+                    req.flags |= 8
                 send_request(req, RequestCallback(lambda r, e: None))
         except Exception:
             log(f"[{self.id}] ERROR in _send_forwarded_message: {traceback.format_exc()}")
@@ -649,7 +660,6 @@ class AutoForwarderPlugin(BasePlugin):
         topic_id = rule.get("destination_topic_id", 0)
 
         try:
-            # For albums, keyword check is performed on the combined captions and filenames
             if keyword_pattern:
                 full_text_to_check = ""
                 for msg_obj in message_objects:
@@ -670,7 +680,6 @@ class AutoForwarderPlugin(BasePlugin):
                 req.flags |= 1
                 
             multi_media_list = ArrayList()
-            # In an album, only the first item's caption is used.
             album_caption, album_entities = "", None
             if filters.get("media_captions", True):
                 for msg_obj in message_objects:
@@ -680,7 +689,6 @@ class AutoForwarderPlugin(BasePlugin):
 
             first_message_obj, first_message = message_objects[0], message_objects[0].messageOwner
             
-            # Build header/quote prefix, same as single messages
             prefix_text, prefix_entities = "", ArrayList()
             if not drop_author:
                 source_entity = self._get_chat_entity(self._get_id_from_peer(first_message.peer_id))
@@ -704,17 +712,16 @@ class AutoForwarderPlugin(BasePlugin):
             header_attached = False
             for original_msg_obj in message_objects:
                 current_msg_obj = original_msg_obj
-                # The getMessage() method doesn't exist, so the attempt to refresh
-                # from cache has been removed.
                 if not self._is_message_allowed_by_filters(current_msg_obj, rule): continue
                 input_media = self._get_input_media(current_msg_obj)
-                if not input_media: continue
+                if not input_media: 
+                    log(f"[{self.id}] Album item dropped – failed to build InputMedia for msg {original_msg_obj.messageOwner.id}")
+                    continue
 
                 single_media = TLRPC.TL_inputSingleMedia()
                 single_media.media = input_media
                 single_media.random_id = random.getrandbits(63)
 
-                # The prefix and album caption are attached only to the first item.
                 if not header_attached:
                     final_caption = f"{prefix_text}\n\n{album_caption}".strip()
                     final_entities = self._prepare_final_entities(prefix_text, prefix_entities, album_entities)
@@ -745,7 +752,6 @@ class AutoForwarderPlugin(BasePlugin):
         author_name = self._get_entity_name(author_entity)
         original_fwd_tag, _ = self._get_original_author_details(replied_message.fwd_from)
 
-        # Create a short snippet of the replied message's content
         quote_snippet = "Media"
         if replied_message_obj.isPhoto(): quote_snippet = "Photo"
         elif replied_message_obj.isVideo(): quote_snippet = "Video"
@@ -761,11 +767,9 @@ class AutoForwarderPlugin(BasePlugin):
         if original_fwd_tag:
             quote_snippet += f" (from {original_fwd_tag})"
 
-        # Combine author name and snippet into the final quote text
         quote_text = f"{author_name}\n\u200b{quote_snippet}"
         entities = ArrayList()
         
-        # Add formatting entities (bold, link) for the author name
         if isinstance(author_entity, TLRPC.TL_user):
             self._add_user_entities(entities, quote_text, author_entity, author_name)
         else:
@@ -773,7 +777,6 @@ class AutoForwarderPlugin(BasePlugin):
             bold_entity.offset, bold_entity.length = 0, self._get_java_len(author_name)
             entities.add(bold_entity)
 
-        # Add the main blockquote entity that covers the entire text
         quote_entity = TLRPC.TL_messageEntityBlockquote()
         quote_entity.offset, quote_entity.length = 0, self._get_java_len(quote_text)
         entities.add(quote_entity)
@@ -809,12 +812,12 @@ class AutoForwarderPlugin(BasePlugin):
         original_author_name, original_author_entity = self._get_original_author_details(message.fwd_from)
         text = f"Forwarded from {group_name} (by {author_name})"
         if original_author_name: text += f" fwd_from {original_author_name}"
-        if isinstance(group, TLRPC.TL_channel): # Supergroups are channels
+        if isinstance(group, TLRPC.TL_channel):
             msg_id = message.id
             group_link = f"https://t.me/{group.username}/{msg_id}" if group.username else f"https://t.me/c/{group.id}/{msg_id}"
             link_entity = TLRPC.TL_messageEntityTextUrl(); link_entity.offset, link_entity.length, link_entity.url = text.find(group_name), self._get_java_len(group_name), group_link
             entities.add(link_entity)
-        else: # Regular groups are just bolded
+        else:
             bold = TLRPC.TL_messageEntityBold(); bold.offset, bold.length = text.find(group_name), self._get_java_len(group_name)
             entities.add(bold)
         if author and isinstance(author, TLRPC.TL_user): self._add_user_entities(entities, text, author, author_name)
@@ -838,11 +841,12 @@ class AutoForwarderPlugin(BasePlugin):
         self._load_forwarding_rules()
         settings_ui = [
             Header(text="General Settings"),
-            Input(key="min_msg_length", text="Minimum Message Length", default=str(DEFAULT_SETTINGS["min_msg_length"]), subtext="For text-only messages."),
-            Input(key="max_msg_length", text="Maximum Message Length", default=str(DEFAULT_SETTINGS["max_msg_length"]), subtext="For text-only messages."),
             Input(key="deferral_timeout_ms", text="Media Deferral Timeout (ms)", default=str(DEFAULT_SETTINGS["deferral_timeout_ms"]), subtext="Safety net for slow media downloads. Increase if files fail to send."),
             Input(key="album_timeout_ms", text="Album Buffering Timeout (ms)", default=str(DEFAULT_SETTINGS["album_timeout_ms"]), subtext="How long to wait for all media in an album before sending."),
-            Input(key="deduplication_window_seconds", text="Deduplication Window (Seconds)", default=str(DEFAULT_SETTINGS["deduplication_window_seconds"]), subtext="Time window to ignore duplicate events and identical files."),
+            Input(key="sequential_delay_seconds", text="Sequential Delay (Seconds)", default=str(DEFAULT_SETTINGS["sequential_delay_seconds"]), subtext="Forces sequential order but slows down forwarding. 0 to disable."),
+            Input(key="deduplication_window_seconds", text="Deduplication Window (Seconds)", default=str(DEFAULT_SETTINGS["deduplication_window_seconds"]), subtext="Time window to ignore duplicate notifications from the client."),
+            Input(key="min_msg_length", text="Minimum Message Length", default=str(DEFAULT_SETTINGS["min_msg_length"]), subtext="For text-only messages."),
+            Input(key="max_msg_length", text="Maximum Message Length", default=str(DEFAULT_SETTINGS["max_msg_length"]), subtext="For text-only messages."),
             Input(key="antispam_delay_seconds", text="Anti-Spam Delay (Seconds)", default=str(DEFAULT_SETTINGS["antispam_delay_seconds"]), subtext="Minimum time between forwards from the same user. 0 to disable."),
             Divider(),
             Header(text="Active Forwarding Rules")
@@ -854,7 +858,7 @@ class AutoForwarderPlugin(BasePlugin):
             for source_id, rule_data in sorted_rules:
                 source_name = self._get_chat_name(source_id)
                 dest_name = self._get_chat_name(rule_data.get("destination", 0)) if rule_data.get("destination") else "Not Set"
-                style = "(Copy)" # This mode primarily copies
+                style = "(Copy)"
                 settings_ui.append(Text(
                     text=f"From: {source_name}\nTo: {dest_name} {style}",
                     icon="msg_edit",
@@ -886,7 +890,6 @@ class AutoForwarderPlugin(BasePlugin):
         current_chat_id = context.get("dialog_id")
         if not current_chat_id: return
         current_chat_id = int(current_chat_id)
-        # If a rule exists, show management options. Otherwise, show the creation dialog.
         if current_chat_id in self.forwarding_rules:
             run_on_ui_thread(lambda: self._show_rule_action_dialog(current_chat_id))
         else:
@@ -931,7 +934,6 @@ class AutoForwarderPlugin(BasePlugin):
             main_layout.setOrientation(LinearLayout.VERTICAL)
             main_layout.setPadding(margin_px, margin_px // 2, margin_px, margin_px // 4)
     
-            # --- Section: Destination Input ---
             set_by_reply_button = TextView(activity)
             input_field = EditText(activity)
             
@@ -951,7 +953,6 @@ class AutoForwarderPlugin(BasePlugin):
             input_field.setLayoutParams(input_field_params)
             main_layout.addView(input_field)
 
-            # --- Section: Main Filters ---
             keyword_filter_input = EditText(activity)
             keyword_filter_input.setHint("Keyword/Regex Filter (optional)")
             keyword_filter_input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
@@ -975,7 +976,6 @@ class AutoForwarderPlugin(BasePlugin):
             quote_replies_checkbox.setTextColor(Theme.getColor(Theme.key_dialogTextBlack)); quote_replies_checkbox.setButtonTintList(checkbox_tint_list)
             quote_replies_checkbox.setLayoutParams(checkbox_params); main_layout.addView(quote_replies_checkbox)
     
-            # --- Section: Topic Forwarding ---
             forward_to_topic_checkbox = CheckBox(activity)
             forward_to_topic_checkbox.setText("Forward to Topic / Comment Thread")
             forward_to_topic_checkbox.setTextColor(Theme.getColor(Theme.key_dialogTextBlack)); forward_to_topic_checkbox.setButtonTintList(checkbox_tint_list)
@@ -988,17 +988,15 @@ class AutoForwarderPlugin(BasePlugin):
             topic_id_input_params = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
             topic_id_input_params.setMargins(margin_px * 2, 0, margin_px, margin_px // 4)
             topic_id_input.setLayoutParams(topic_id_input_params)
-            topic_id_input.setVisibility(View.GONE) # Hidden by default
+            topic_id_input.setVisibility(View.GONE)
             main_layout.addView(topic_id_input)
     
-            # Listener to show/hide the Topic ID input field
             class TopicCheckboxListener(dynamic_proxy(CompoundButton.OnCheckedChangeListener)):
                 def __init__(self, input_field): super().__init__(); self.input_field = input_field
                 def onCheckedChanged(self, buttonView, isChecked):
                     self.input_field.setVisibility(View.VISIBLE if isChecked else View.GONE)
             forward_to_topic_checkbox.setOnCheckedChangeListener(TopicCheckboxListener(topic_id_input))
     
-            # --- Section: Author Filtering ---
             divider_params = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1); vertical_margin_px = int(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 12, activity.getResources().getDisplayMetrics()))
             divider_params.setMargins(margin_px, vertical_margin_px, margin_px, vertical_margin_px)
             divider_one = View(activity); divider_one.setBackgroundColor(Theme.getColor(Theme.key_divider)); divider_one.setLayoutParams(divider_params); main_layout.addView(divider_one)
@@ -1038,7 +1036,6 @@ class AutoForwarderPlugin(BasePlugin):
             listener = AuthorCheckboxListener(update_author_filter_visibility)
             forward_users_checkbox.setOnCheckedChangeListener(listener); forward_bots_checkbox.setOnCheckedChangeListener(listener)
     
-            # --- Section: Content Type Filtering ---
             divider_two = View(activity); divider_two.setBackgroundColor(Theme.getColor(Theme.key_divider)); divider_two.setLayoutParams(divider_params); main_layout.addView(divider_two)
     
             filter_header = TextView(activity)
@@ -1053,7 +1050,6 @@ class AutoForwarderPlugin(BasePlugin):
                 cb.setButtonTintList(checkbox_tint_list); cb.setLayoutParams(checkbox_params)
                 main_layout.addView(cb); filter_checkboxes[key] = cb
     
-            # --- Pre-fill dialog if editing an existing rule ---
             if existing_rule:
                 dest_entity = self._get_chat_entity(existing_rule.get("destination", 0))
                 input_field.setText(f"@{dest_entity.username}" if dest_entity and hasattr(dest_entity, 'username') and dest_entity.username else str(existing_rule.get("destination", 0)))
@@ -1069,7 +1065,7 @@ class AutoForwarderPlugin(BasePlugin):
                 forward_users_checkbox.setChecked(existing_rule.get("forward_users", True)); forward_bots_checkbox.setChecked(existing_rule.get("forward_bots", True))
                 forward_outgoing_checkbox.setChecked(existing_rule.get("forward_outgoing", True))
                 for key, cb in filter_checkboxes.items(): cb.setChecked(existing_rule.get("filters", {}).get(key, True))
-            else: # Default values for a new rule
+            else:
                 drop_author_checkbox.setChecked(False); quote_replies_checkbox.setChecked(True)
                 forward_users_checkbox.setChecked(True); forward_bots_checkbox.setChecked(True); forward_outgoing_checkbox.setChecked(True)
                 for cb in filter_checkboxes.values(): cb.setChecked(True)
@@ -1078,7 +1074,6 @@ class AutoForwarderPlugin(BasePlugin):
             scroller.addView(main_layout)
             builder.set_view(scroller)
     
-            # --- Dialog Button Actions ---
             def on_set_click(d, w):
                 topic_id_str = topic_id_input.getText().toString()
                 topic_id = int(topic_id_str) if forward_to_topic_checkbox.isChecked() and topic_id_str.isdigit() else 0
@@ -1117,14 +1112,13 @@ class AutoForwarderPlugin(BasePlugin):
         builder.set_message("Click 'Proceed', then go to your desired destination chat (or topic) and REPLY to ANY message with the exact word 'set'. The reply will be auto-deleted.")
         
         def on_proceed(b, w):
-            # Capture all settings from the UI before starting the listener
             rule_settings = {
                 "keyword_pattern": ui_elements['keyword_filter_input'].getText().toString(),
                 "author_filter": ui_elements['author_filter_input'].getText().toString(),
                 "drop_author": ui_elements['drop_author_checkbox'].isChecked(),
                 "quote_replies": ui_elements['quote_replies_checkbox'].isChecked(),
                 "forward_to_topic": ui_elements['forward_to_topic_checkbox'].isChecked(),
-                "destination_topic_id": 0, # This will be detected automatically
+                "destination_topic_id": 0,
                 "forward_users": ui_elements['forward_users_checkbox'].isChecked(),
                 "forward_bots": ui_elements['forward_bots_checkbox'].isChecked(),
                 "forward_outgoing": ui_elements['forward_outgoing_checkbox'].isChecked(),
@@ -1179,12 +1173,10 @@ class AutoForwarderPlugin(BasePlugin):
     def _process_reply_trigger(self, message_object):
         """
         Handles the logic after a 'set' message is detected.
-        This now works for both replies and direct messages sent to a topic.
         """
         try:
             msg = message_object.messageOwner
 
-            # We can now proceed. Stop the listener and cancel the timeout.
             self.is_listening_for_reply = False
             if self.reply_listener_timeout_task:
                 self.handler.removeCallbacks(self.reply_listener_timeout_task)
@@ -1197,21 +1189,17 @@ class AutoForwarderPlugin(BasePlugin):
             dest_name = self._get_chat_name(dest_id)
             
             detected_topic_id = 0
-            # A message sent to a topic (or as a reply) will have a 'reply_to' header.
             if hasattr(msg, 'reply_to') and msg.reply_to:
                 reply_header = msg.reply_to
                 
-                # Priority 1: Modern "Forum Topics" have a 'reply_to_top_id'.
                 if hasattr(reply_header, 'reply_to_top_id') and reply_header.reply_to_top_id != 0:
                     detected_topic_id = reply_header.reply_to_top_id
-                # Priority 2: Fallback for "Comment Threads" which are anchored to a message ID.
                 elif hasattr(reply_header, 'reply_to_msg_id'):
                     detected_topic_id = reply_header.reply_to_msg_id
 
             if detected_topic_id > 0 and rule_settings is not None:
                 rule_settings["destination_topic_id"] = detected_topic_id
 
-            # Finalize the rule with all the discovered information.
             self._finalize_rule(
                 context.get('source_id'),
                 context.get('source_name'),
@@ -1220,7 +1208,6 @@ class AutoForwarderPlugin(BasePlugin):
                 rule_settings
             )
             
-            # Auto-delete the 'set' message to keep the chat clean.
             self._delete_message_by_id(msg.dialog_id, msg.id)
             
             self.reply_listener_context = {}
@@ -1247,7 +1234,6 @@ class AutoForwarderPlugin(BasePlugin):
             "forward_outgoing": forward_outgoing, "filter_settings": filter_settings
         }
 
-        # Route the input to the correct resolver based on its format.
         if "/joinchat/" in cleaned_input or "/+" in cleaned_input:
             self._resolve_as_invite_link(cleaned_input, source_id, source_name, rule_settings)
             return
@@ -1258,10 +1244,8 @@ class AutoForwarderPlugin(BasePlugin):
             if cached_entity:
                 self._finalize_rule(source_id, source_name, self._get_id_for_storage(cached_entity), self._get_entity_name(cached_entity), rule_settings)
                 return
-            # If not in cache, try a network request.
             self._resolve_by_id_shotgun(input_as_int, source_id, source_name, rule_settings)
         except ValueError:
-            # If it's not a number, treat it as a username or public link.
             self._resolve_as_username(cleaned_input, source_id, source_name, rule_settings)
 
     def _resolve_as_invite_link(self, cleaned_input, source_id, source_name, rule_settings):
@@ -1303,7 +1287,6 @@ class AutoForwarderPlugin(BasePlugin):
             else:
                 BulletinHelper.show_error(f"Could not find chat by ID: {input_as_int}", get_last_fragment())
 
-        # The API for getting a chat by ID is tricky, so we try a few common variations.
         req = TLRPC.TL_messages_getChats()
         id_list = ArrayList()
         possible_ids = HashSet()
@@ -1404,7 +1387,6 @@ class AutoForwarderPlugin(BasePlugin):
             id_list = ArrayList()
             id_list.add(Integer(message_id))
             channel_id = 0
-            # The controller needs a specific channel_id format for supergroups.
             if str(chat_id).startswith("-100"):
                 channel_id = int(str(chat_id)[4:])
             get_messages_controller().deleteMessages(id_list, None, None, chat_id, 0, True, channel_id)
@@ -1415,7 +1397,7 @@ class AutoForwarderPlugin(BasePlugin):
     def _is_media_complete(self, message):
         """Checks if a message's media has a file reference, indicating it's ready to forward."""
         if not message or not hasattr(message, 'media') or not message.media:
-            return True # Not media, so it's "complete"
+            return True
         if hasattr(message.media, 'photo') and getattr(message.media.photo, 'file_reference', None):
             return True
         if hasattr(message.media, 'document') and getattr(message.media.document, 'file_reference', None):
@@ -1466,12 +1448,10 @@ class AutoForwarderPlugin(BasePlugin):
         if not text_to_check:
             return False
         try:
-            # Try to compile as regex first for advanced matching.
             compiled_regex = re.compile(pattern, re.IGNORECASE)
             if compiled_regex.search(text_to_check):
                 return True
         except re.error:
-            # If regex fails, fall back to simple substring matching.
             if pattern.lower() in text_to_check.lower():
                 return True
         return False
@@ -1531,11 +1511,9 @@ class AutoForwarderPlugin(BasePlugin):
         final_entities = ArrayList()
         if prefix_entities: final_entities.addAll(prefix_entities)
         if original_entities and not original_entities.isEmpty():
-            # The offset needs to account for the length of the prefix and the two newlines.
             offset_shift = self._get_java_len(prefix_text) + 2 if prefix_text else 0
             for i in range(original_entities.size()):
                 old = original_entities.get(i)
-                # Re-create the entity to avoid modifying the original
                 new = type(old)()
                 new.offset, new.length = old.offset + offset_shift, old.length
                 if hasattr(old, 'url'): new.url = old.url
@@ -1661,7 +1639,6 @@ class AutoForwarderPlugin(BasePlugin):
             layout.setPadding(margin_px, margin_px // 2, margin_px, margin_px // 2)
             faq_text_view = TextView(activity)
             
-            # Simple markdown to HTML for the FAQ text
             def process_inline_markdown(text):
                 text = re.sub(r'\[(.*?)\]\((.*?)\)', r'<a href="\2">\1</a>', text)
                 text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
@@ -1690,7 +1667,6 @@ class AutoForwarderPlugin(BasePlugin):
                 else: html_lines.append(process_inline_markdown(content_spoilers_processed))
 
             html_text = re.sub(r'(<br>\s*){2,}', '<br><br>', '<br>'.join(html_lines))
-            # Use legacy mode for broader compatibility
             if hasattr(Html, 'FROM_HTML_MODE_LEGACY'):
                 faq_text_view.setText(Html.fromHtml(html_text, Html.FROM_HTML_MODE_LEGACY))
             else:
@@ -1714,7 +1690,7 @@ class AutoForwarderPlugin(BasePlugin):
     def _updater_loop(self):
         """A background thread that periodically checks for new plugin updates."""
         log(f"[{self.id}] Updater loop started.")
-        time.sleep(60) # Initial delay before first check
+        time.sleep(60)
         while not self.stop_updater_thread.is_set():
             self.check_for_updates(is_manual=False)
             self.stop_updater_thread.wait(self.UPDATE_INTERVAL_SECONDS)
@@ -1739,9 +1715,8 @@ class AutoForwarderPlugin(BasePlugin):
                 scanner.close()
                 release_data = json.loads(response_str)
                 latest_version_tag = release_data.get("tag_name", "0.0.0").lstrip('v')
-                current_version = __version__
+                current_version = __version__.split('-')[0]
                 
-                # Compare versions using tuples for correctness (e.g., 1.10.0 > 1.9.0)
                 latest_v_tuple = tuple(map(int, latest_version_tag.split('.')))
                 current_v_tuple = tuple(map(int, current_version.split('.')))
 
